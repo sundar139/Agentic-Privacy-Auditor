@@ -1,4 +1,4 @@
-from langchain_ollama import OllamaLLM
+import os
 from langchain_core.documents import Document
 
 _BASE_PROMPT = """You are a strict Privacy Policy Compliance Auditor.
@@ -29,7 +29,6 @@ Question: {question}
 Strictly grounded answer:"""
 
 def _format_context(docs: list[Document]) -> str:
-    """Format retrieved documents into a numbered context block."""
     parts = []
     for i, doc in enumerate(docs, 1):
         m = doc.metadata
@@ -41,15 +40,38 @@ def _format_context(docs: list[Document]) -> str:
         parts.append(f"{header}\n{doc.page_content}")
     return "\n\n".join(parts)
 
+def _generate_with_ollama(prompt: str, model: str = "qwen2.5:7b") -> str:
+    from langchain_ollama import OllamaLLM
+    llm = OllamaLLM(model=model, temperature=0)
+    return llm.invoke(prompt)
+
+def _generate_with_hf(prompt: str) -> str:
+    from huggingface_hub import InferenceClient
+    client = InferenceClient(
+        model="Qwen/Qwen2.5-7B-Instruct",
+        token=os.environ["HF_TOKEN"],
+    )
+    response = client.text_generation(
+        prompt,
+        max_new_tokens=1024,
+        temperature=0.01,  # Near-zero but HF API requires > 0
+        do_sample=False,
+        stop_sequences=["Question:", "---"],
+    )
+    return response.strip()
+
 def generate_answer(
     question: str,
     docs: list[Document],
     llm_model: str = "qwen2.5:7b",
     strict: bool = False,
 ) -> str:
-    llm = OllamaLLM(model=llm_model, temperature=0)
     context = _format_context(docs)
     prompt = (_STRICT_PROMPT if strict else _BASE_PROMPT).format(
         context=context, question=question
     )
-    return llm.invoke(prompt)
+
+    if os.environ.get("HF_TOKEN"):
+        return _generate_with_hf(prompt)
+    else:
+        return _generate_with_ollama(prompt, llm_model)
