@@ -108,19 +108,49 @@ def _generate_with_ollama(prompt: str, model: str = "qwen2.5:7b") -> str:
     return llm.invoke(prompt)
 
 
+def _is_quota_error(exc: Exception) -> bool:
+    """Returns True for HTTP 402 Payment Required / 429 Too Many Requests errors."""
+    msg = str(exc).lower()
+    return any(code in msg for code in ("402", "429", "payment required", "too many requests", "rate limit"))
+
+
+def _is_server_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(code in msg for code in ("500", "502", "503", "504", "service unavailable", "internal server error"))
+
+
 def _generate_with_hf(prompt: str) -> str:
     from huggingface_hub import InferenceClient
     client = InferenceClient(
         model="Qwen/Qwen2.5-7B-Instruct",
         token=os.environ["HF_TOKEN"],
     )
-    response = client.chat_completion(
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
-        temperature=0.01,
-        stop=["Question:", "---"],
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=0.01,
+            stop=["Question:", "---"],
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as exc:
+        if _is_quota_error(exc):
+            # Attempt Ollama fallback before giving up
+            try:
+                print("[Generation] HF 402/429 — attempting Ollama fallback.")
+                return _generate_with_ollama(prompt)
+            except Exception:
+                raise RuntimeError(
+                    "⚠️ The HuggingFace inference service is temporarily unavailable "
+                    "(quota or rate limit reached). Please top up your HF credits, "
+                    "wait a few minutes, or run the app locally with Ollama."
+                ) from exc
+        if _is_server_error(exc):
+            raise RuntimeError(
+                "⚠️ The inference service returned a server error. "
+                "Please try again in a moment."
+            ) from exc
+        raise
 
 
 def generate_answer(

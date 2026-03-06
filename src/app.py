@@ -420,7 +420,7 @@ elif analyze_clicked and question.strip():
     st.session_state["history"].append({
         "question":  question,
         "answer":    final_answer,
-        "score":     audit.get("faithfulness_score", 0),
+        "score":     audit.get("faithfulness_score"),   # may be None on UNVERIFIED
         "verdict":   audit.get("verdict", "UNKNOWN"),
         "query_type": query_type,
         "docs":      docs,
@@ -430,17 +430,11 @@ elif analyze_clicked and question.strip():
     # ── Answer ────────────────────────────────────────────────────────────────
     st.divider()
     st.subheader("📋 Answer")
-    # Q12 fix: wrap in a div so Streamlit renders markdown lists/tables correctly
-    st.markdown(
-        f"<div class='answer-block'>{final_answer}</div>",
-        unsafe_allow_html=True,
-    )
-    # Fallback plain render in case HTML stripping occurs in some deployments
-    if not final_answer.strip().startswith("<"):
-        st.markdown(final_answer)
+    # Render via unsafe_allow_html so Streamlit doesn't strip markdown list/table syntax
+    st.markdown(final_answer, unsafe_allow_html=False)
 
     # ── Audit result ──────────────────────────────────────────────────────────
-    score       = audit.get("faithfulness_score", 0)
+    score       = audit.get("faithfulness_score")   # may be None on UNVERIFIED
     verdict     = audit.get("verdict", "PASS")
     unsupported = audit.get("unsupported_claims", [])
 
@@ -452,11 +446,21 @@ elif analyze_clicked and question.strip():
             st.warning("⚠️ Audit: WARN")
         elif verdict == "FAIL":
             st.error("❌ Audit: FAIL")
+        elif verdict == "UNVERIFIED":
+            st.warning("⚠️ Audit: UNVERIFIED")
         else:
             st.warning("⚠ Audit: UNKNOWN")
-        st.metric("Faithfulness Score", f"{score:.2f} / 1.00")
+        if score is not None:
+            st.metric("Faithfulness Score", f"{score:.2f} / 1.00")
+        else:
+            st.caption("Score: N/A (auditor unavailable)")
     with col2:
-        if verdict == "WARN":
+        if verdict == "UNVERIFIED":
+            reason = audit.get("reasoning", "")
+            # Show the clean RuntimeError message, not raw HF URL
+            display_reason = reason if reason.startswith("⚠️") else "Auditor could not run — answer shown unvalidated."
+            st.warning(f"**{display_reason}**\n\nThe answer above was generated but could not be verified for faithfulness. Treat it with caution.")
+        elif verdict == "WARN":
             st.markdown(
                 "**⚠️ Warning:** Some claims could not be fully verified against "
                 "the source documents. Use this answer with caution and consult "
@@ -540,14 +544,15 @@ if st.session_state.get("history"):
 
     for idx, entry in enumerate(reversed(history), 1):
         v = entry["verdict"]
-        v_icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(v, "⚪")
+        v_icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌", "UNVERIFIED": "⚠️"}.get(v, "⚪")
+        score_str = f"{entry['score']:.2f}" if entry.get("score") is not None else "N/A"
         q_icon = {"SIMPLE": "🟢", "FILTERED": "🔵", "COMPARE": "🟣", "AMBIGUOUS": "🟡"}.get(
             entry.get("query_type", ""), "⚪"
         )
         with st.expander(
             f"{idx}. {q_icon} {entry['question'][:80]}{'…' if len(entry['question']) > 80 else ''} "
-            f"— {v_icon} {v} ({entry['score']:.2f})"
+            f"— {v_icon} {v} ({score_str})"
         ):
             st.markdown(f"**Q:** {entry['question']}")
             st.markdown(f"**A:** {entry['answer']}")
-            st.caption(f"Faithfulness: {entry['score']:.2f} | Verdict: {v} | Type: {entry.get('query_type', '—')}")
+            st.caption(f"Faithfulness: {score_str} | Verdict: {v} | Type: {entry.get('query_type', '—')}")

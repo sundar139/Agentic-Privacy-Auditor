@@ -18,9 +18,30 @@ def _get_llm(model: str = "qwen2.5:7b"):
         from langchain_ollama import OllamaLLM
         return OllamaLLM(model=model, temperature=0)
 
+def _is_quota_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(code in msg for code in ("402", "429", "payment required", "too many requests", "rate limit"))
+
+def _is_server_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(code in msg for code in ("500", "502", "503", "504", "service unavailable"))
+
 def _llm_invoke(llm, prompt: str) -> str:
-    raw = llm.invoke(prompt)
-    return raw.content if hasattr(raw, "content") else raw
+    try:
+        raw = llm.invoke(prompt)
+        return raw.content if hasattr(raw, "content") else raw
+    except Exception as exc:
+        if _is_quota_error(exc):
+            raise RuntimeError(
+                "⚠️ The HuggingFace inference service is temporarily unavailable "
+                "(quota or rate limit reached). Please top up your HF credits or "
+                "run locally with Ollama."
+            ) from exc
+        if _is_server_error(exc):
+            raise RuntimeError(
+                "⚠️ The inference service returned a server error. Please try again."
+            ) from exc
+        raise
 
 _AUDITOR_PROMPT = """You are a factual auditor. Verify whether every specific claim in
 the AI-generated answer is directly supported by the source excerpts below.
@@ -87,7 +108,18 @@ class AuditorAgent:
                 "unsupported_claims": ["No source documents were retrieved."],
                 "reasoning": "Answer has no grounding.",
             }
-        raw = _llm_invoke(self.llm, _AUDITOR_PROMPT.format(context=_format_context(docs), answer=answer))
+        try:
+            raw = _llm_invoke(self.llm, _AUDITOR_PROMPT.format(context=_format_context(docs), answer=answer))
+        except RuntimeError as exc:
+            # 402/429/5xx from HF — return a degraded-but-informative audit result
+            # so the answer is still shown with a warning, not suppressed entirely
+            print(f"[Auditor] LLM call failed: {exc}")
+            return {
+                "faithfulness_score": None,
+                "verdict": "UNVERIFIED",
+                "unsupported_claims": [],
+                "reasoning": str(exc),
+            }
         try:
             result = _extract_json(raw)
         except (json.JSONDecodeError, AttributeError):

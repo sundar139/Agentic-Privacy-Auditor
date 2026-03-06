@@ -55,8 +55,22 @@ def _get_llm(model: str = "qwen2.5:7b"):
 
 
 def _llm_invoke(llm, prompt: str) -> str:
-    raw = llm.invoke(prompt)
-    return raw.content if hasattr(raw, "content") else raw
+    try:
+        raw = llm.invoke(prompt)
+        return raw.content if hasattr(raw, "content") else raw
+    except Exception as exc:
+        msg = str(exc).lower()
+        if any(code in msg for code in ("402", "429", "payment required", "too many requests", "rate limit")):
+            raise RuntimeError(
+                "⚠️ The HuggingFace inference service is temporarily unavailable "
+                "(quota or rate limit reached). Please top up your HF credits or "
+                "run locally with Ollama."
+            ) from exc
+        if any(code in msg for code in ("500", "502", "503", "504", "service unavailable")):
+            raise RuntimeError(
+                "⚠️ The inference service returned a server error. Please try again."
+            ) from exc
+        raise
 
 
 # ─────────────────────────────────────────────
