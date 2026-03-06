@@ -1,35 +1,135 @@
 import os
 import sys
+import json
 import streamlit as st
 
+# ── Path setup ────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from embeddings.embedding_manager import get_embedding_model
-from embeddings.vector_store import load_vector_store
-from agents.planner import PlannerAgent
-from agents.auditor import AuditorAgent
-from retrieval.generation import generate_answer
-
 # ── Page config ───────────────────────────────────────────────────────────────
-
 st.set_page_config(
     page_title="Privacy Policy Auditor",
     page_icon="🔍",
     layout="wide",
 )
 
-# ── Pipeline (cached — loads once per session) ────────────────────────────────
+# ── HF_TOKEN startup check (only enforced on HF Spaces) ──────────────────────
+# SPACE_ID is set automatically by HuggingFace Spaces; not present locally.
+if os.environ.get("SPACE_ID") and not os.environ.get("HF_TOKEN"):
+    st.error(
+        "❌ **HF_TOKEN is not configured.**\n\n"
+        "Go to **Space Settings → Secrets** and add `HF_TOKEN` with your "
+        "HuggingFace access token. The app cannot start without it."
+    )
+    st.stop()
 
-@st.cache_resource(show_spinner="Loading AI pipeline...")
-def load_pipeline():
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    VECTOR_STORE_DIR = os.path.join(BASE_DIR, "data", "vector_store")
+
+# ── Vector store path resolution ──────────────────────────────────────────────
+
+def _resolve_vector_store_path() -> str:
+    candidates = [
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "vector_store",
+        ),
+        "/app/data/vector_store",
+        os.path.join(os.getcwd(), "data", "vector_store"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[-1]
+
+
+# ── Lazy pipeline loader ──────────────────────────────────────────────────────
+
+@st.cache_resource(show_spinner=False)
+def _load_pipeline():
+    from embeddings.embedding_manager import get_embedding_model
+    from embeddings.vector_store import load_vector_store
+    from agents.planner import PlannerAgent
+    from agents.auditor import AuditorAgent
+
+    vector_store_dir = _resolve_vector_store_path()
     embeddings = get_embedding_model()
-    vectorstore = load_vector_store(embeddings, VECTOR_STORE_DIR)
-    return PlannerAgent(vectorstore), AuditorAgent()
+    vectorstore = load_vector_store(embeddings, vector_store_dir)
+    planner = PlannerAgent(vectorstore)
+    auditor = AuditorAgent()
+    return planner, auditor, vectorstore   # ← include vectorstore for corpus browser
 
 
-planner, auditor = load_pipeline()
+def get_pipeline():
+    try:
+        return _load_pipeline(), None
+    except Exception as e:
+        return None, str(e)
+
+
+# ── Corpus site list (cached once after pipeline loads) ───────────────────────
+
+@st.cache_data(show_spinner=False)
+def _get_corpus_sites(_vectorstore) -> list[str]:
+    """Return sorted list of unique URLs from the vector store metadata."""
+    try:
+        all_meta = _vectorstore.get()["metadatas"]
+        sites = sorted({
+            m.get("url", "").strip()
+            for m in all_meta
+            if m.get("url", "").strip() not in ("", "unknown")
+        })
+        return sites
+    except Exception:
+        return []
+
+
+# ── Plan diagnostic warnings ──────────────────────────────────────────────────
+
+def _show_corpus_warnings(plan: dict) -> None:
+    if plan.get("corpus_miss"):
+        site = plan.get("corpus_miss_site", "that website")
+        st.warning(
+            f"⚠️ **'{site}' is not in the OPP-115 corpus.**\n\n"
+            f"The dataset covers 115 specific websites collected in 2015–2016. "
+            f"The answer below is drawn from semantically similar policies and may "
+            f"**not** reflect **{site}**'s actual privacy policy.",
+        )
+
+    compare_misses = plan.get("compare_misses", [])
+    if compare_misses:
+        missing_str = ", ".join(f"**{s}**" for s in compare_misses)
+        st.warning(
+            f"⚠️ The following site(s) are **not in the OPP-115 corpus**: {missing_str}.\n\n"
+            f"The comparison below only covers the site(s) that were found.",
+        )
+
+    if plan.get("year_filter"):
+        st.info(f"ℹ️ Results pre-filtered to policies collected in **{plan['year_filter']}**.")
+
+    if plan.get("quote_query") and plan.get("section_filter"):
+        st.info(f"ℹ️ Section-targeted retrieval applied: `{plan['section_filter']}`")
+
+
+# ── Corpus information (OPP-115 dataset scope) ────────────────────────────────
+
+_OPP115_INFO = """
+The **OPP-115 Corpus** contains privacy policies from **115 real websites**,
+collected in **2015–2016** and fully annotated by legal experts across 8 categories:
+
+| Category | Slug |
+|---|---|
+| First Party Collection/Use | `first_party_collection` |
+| Third Party Sharing | `third_party_sharing` |
+| User Choice/Control | `user_choice` |
+| User Access, Edit & Deletion | `user_access` |
+| Data Retention | `data_retention` |
+| Data Security | `data_security` |
+| Policy Change | `policy_change` |
+| Do Not Track | `do_not_track` |
+
+⚠️ **Scope note:** Policies reflect 2015–2016 language. Sites not listed below 
+are **not in this dataset** and cannot be accurately answered.
+"""
+
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
@@ -51,21 +151,50 @@ with st.sidebar:
     st.markdown(
         "- 🟢 **SIMPLE** — broad question across all policies\n"
         "- 🔵 **FILTERED** — mention a specific site\n"
-        "- 🟣 **COMPARE** — compare two named sites"
+        "- 🟣 **COMPARE** — compare two named sites\n"
+        "- 🟡 **AMBIGUOUS** — vague pronoun (will ask to clarify)"
     )
     st.divider()
 
     st.markdown("### Try these")
     samples = [
         "What types of personal data do websites collect?",
-        "What does amazon.com say about third-party data sharing?",
-        "How does google.com handle cookies?",
+        "What does nytimes.com say about third-party data sharing?",
+        "How does washingtonpost.com handle cookies?",
         "Compare how nytimes.com and theatlantic.com treat user data.",
         "Which policies mention data retention periods?",
+        "Do they sell my data?",
     ]
     for sample in samples:
         if st.button(sample, use_container_width=True, key=sample):
             st.session_state["question_input"] = sample
+
+    st.divider()
+
+    # Corpus scope info
+    with st.expander("📚 Dataset Scope & Categories"):
+        st.markdown(_OPP115_INFO)
+
+    # Corpus browser — loads after pipeline is warmed up
+    with st.expander("🔎 Browse Available Sites"):
+        if "corpus_sites" in st.session_state:
+            sites = st.session_state["corpus_sites"]
+            if sites:
+                st.caption(f"{len(sites)} sites in corpus")
+                selected = st.selectbox(
+                    "Pick a site to pre-fill question:",
+                    ["— select —"] + sites,
+                    key="site_browser",
+                )
+                if selected and selected != "— select —":
+                    if st.button("Use this site", key="use_site"):
+                        st.session_state["question_input"] = (
+                            f"What does {selected} say about data collection?"
+                        )
+            else:
+                st.caption("Run a query first to load the site list.")
+        else:
+            st.caption("Run a query first to load the site list.")
 
     st.divider()
     st.markdown(
@@ -73,41 +202,137 @@ with st.sidebar:
         "Dataset: [OPP-115 Corpus](https://usableprivacy.org/data)"
     )
 
+
 # ── Main area ─────────────────────────────────────────────────────────────────
 
 st.title("🔍 Agentic Privacy & Compliance Auditor")
-st.caption("Ask questions about 115 real website privacy policies — answers validated for hallucinations.")
+st.caption(
+    "Ask questions about 115 real website privacy policies — "
+    "answers are validated for hallucinations."
+)
 
 question = st.text_input(
     label="Your question",
-    placeholder="e.g. What does amazon.com say about sharing data with third parties?",
+    placeholder="e.g. What does nytimes.com say about sharing data with third parties?",
     key="question_input",
 )
 
-if st.button("🔎 Analyze", type="primary") and question.strip():
+analyze_clicked = st.button("🔎 Analyze", type="primary")
 
-    with st.spinner("Planner routing your query..."):
-        docs, plan = planner.retrieve(question)
+# ── Analysis flow ─────────────────────────────────────────────────────────────
 
-    # Query type badge
-    qtype = plan.get("type", "SIMPLE")
-    badge = {"SIMPLE": "🟢", "FILTERED": "🔵", "COMPARE": "🟣"}.get(qtype, "⚪")
-    st.markdown(f"**Query type:** {badge} `{qtype}` — {plan.get('reasoning', '')}")
+if analyze_clicked and not question.strip():
+    st.warning("Please enter a question before clicking Analyze.")
 
-    if not docs:
-        st.warning("No relevant segments found. Try rephrasing your question.")
+elif analyze_clicked and question.strip():
+
+    # ── Step 1/4: Pipeline ────────────────────────────────────────────────────
+    with st.spinner("⚙️ Step 1/4 — Loading AI pipeline..."):
+        pipeline, load_error = get_pipeline()
+
+    if load_error:
+        st.error(f"❌ Failed to load pipeline: {load_error}")
+        st.markdown(
+            "**Possible causes:**\n"
+            "- Vector store not found — run `python src/ingestion/ingest.py` first\n"
+            "- Ollama not running — start with `ollama serve`\n"
+            f"\n**Vector store path checked:** `{_resolve_vector_store_path()}`"
+        )
         st.stop()
 
-    with st.spinner("Generating answer..."):
-        answer = generate_answer(question, docs)
+    planner, auditor, vectorstore = pipeline
 
-    with st.spinner("Auditor validating..."):
-        final_answer, audit = auditor.audit_and_regenerate(
-            question=question,
-            answer=answer,
-            docs=docs,
-            generate_fn=generate_answer,
+    # Cache available sites in session_state for corpus browser
+    if "corpus_sites" not in st.session_state:
+        st.session_state["corpus_sites"] = _get_corpus_sites(vectorstore)
+
+    # ── Step 2/4: Planner + Retrieval ─────────────────────────────────────────
+    with st.spinner("🧭 Step 2/4 — Planner routing and retrieving segments..."):
+        try:
+            docs, plan = planner.retrieve(question)
+        except Exception as e:
+            st.error(f"❌ Planner failed: {e}")
+            st.stop()
+
+    query_type = plan.get("type", "SIMPLE")
+    badge = {"SIMPLE": "🟢", "FILTERED": "🔵", "COMPARE": "🟣", "AMBIGUOUS": "🟡"}.get(query_type, "⚪")
+    st.markdown(f"**Query type:** {badge} `{query_type}` — {plan.get('reasoning', '')}")
+
+    # AMBIGUOUS: stop and ask for clarification
+    if plan.get("ambiguous"):
+        st.warning(
+            "🟡 **Please clarify your question.**\n\n"
+            "Your question uses a vague reference (e.g. 'they', 'it', 'the company') "
+            "without naming a specific website.\n\n"
+            "Try rephrasing with a site name, for example:\n"
+            "- *What does **nytimes.com** say about data collection?*\n"
+            "- *Does **washingtonpost.com** sell user data?*\n\n"
+            "You can browse the 115 available sites in the sidebar under **Browse Available Sites**."
         )
+        st.stop()
+
+    _show_corpus_warnings(plan)
+
+    # COMPARE: stop if ALL sites are missing
+    if query_type == "COMPARE":
+        all_sites = [sq.get("filters", {}).get("url", "") for sq in plan.get("sub_queries", [])]
+        all_sites = [s for s in all_sites if s]
+        misses = plan.get("compare_misses", [])
+        if all_sites and set(misses) >= set(all_sites):
+            st.error(
+                "❌ None of the requested sites are in the OPP-115 corpus. "
+                "No comparison can be generated."
+            )
+            st.stop()
+
+    if not docs:
+        st.warning(
+            "No relevant policy segments found. "
+            "Try rephrasing or mentioning a specific website."
+        )
+        st.stop()
+
+    # ── Step 3/4: Generate ────────────────────────────────────────────────────
+    with st.spinner("🧠 Step 3/4 — LLM generating grounded answer..."):
+        try:
+            from retrieval.generation import generate_answer
+            answer = generate_answer(question, docs)
+        except Exception as e:
+            st.error(f"❌ Generation failed: {e}")
+            st.stop()
+
+    # ── Step 4/4: Audit ───────────────────────────────────────────────────────
+    with st.spinner("✅ Step 4/4 — Auditor validating faithfulness..."):
+        try:
+            from retrieval.generation import generate_answer
+            final_answer, audit = auditor.audit_and_regenerate(
+                question=question,
+                answer=answer,
+                docs=docs,
+                generate_fn=generate_answer,
+            )
+        except Exception as e:
+            st.warning(f"⚠ Auditor error: {e}. Showing unvalidated answer.")
+            final_answer = answer
+            audit = {
+                "faithfulness_score": 0.0,
+                "verdict": "UNKNOWN",
+                "unsupported_claims": [],
+                "reasoning": "Audit could not be completed.",
+            }
+
+    # ── Save to history ───────────────────────────────────────────────────────
+    if "history" not in st.session_state:
+        st.session_state["history"] = []
+    st.session_state["history"].append({
+        "question":  question,
+        "answer":    final_answer,
+        "score":     audit.get("faithfulness_score", 0),
+        "verdict":   audit.get("verdict", "UNKNOWN"),
+        "query_type": query_type,
+        "docs":      docs,
+        "audit":     audit,
+    })
 
     # ── Answer ────────────────────────────────────────────────────────────────
     st.divider()
@@ -115,24 +340,61 @@ if st.button("🔎 Analyze", type="primary") and question.strip():
     st.markdown(final_answer)
 
     # ── Audit result ──────────────────────────────────────────────────────────
-    score = audit.get("faithfulness_score", 0)
-    verdict = audit.get("verdict", "PASS")
+    score       = audit.get("faithfulness_score", 0)
+    verdict     = audit.get("verdict", "PASS")
     unsupported = audit.get("unsupported_claims", [])
 
     col1, col2 = st.columns([1, 3])
     with col1:
-        (st.success if verdict == "PASS" else st.error)(
-            f"{'✅' if verdict == 'PASS' else '❌'} Audit: {verdict}"
-        )
+        if verdict == "PASS":
+            st.success("✅ Audit: PASS")
+        elif verdict == "WARN":
+            st.warning("⚠️ Audit: WARN")
+        elif verdict == "FAIL":
+            st.error("❌ Audit: FAIL")
+        else:
+            st.warning("⚠ Audit: UNKNOWN")
         st.metric("Faithfulness Score", f"{score:.2f} / 1.00")
     with col2:
-        st.markdown(f"**Auditor reasoning:** {audit.get('reasoning', '')}")
+        if verdict == "WARN":
+            st.markdown(
+                "**⚠️ Warning:** Some claims could not be fully verified against "
+                "the source documents. Use this answer with caution and consult "
+                "the source segments below."
+            )
+        reasoning = audit.get("reasoning", "")
+        if reasoning:
+            st.markdown(f"**Auditor reasoning:** {reasoning}")
         if unsupported:
             st.markdown("**Unsupported claims flagged:**")
             for claim in unsupported:
                 st.markdown(f"- ⚠ {claim}")
 
-    # ── Sources ───────────────────────────────────────────────────────────────
+    # ── Export ────────────────────────────────────────────────────────────────
+    export_data = {
+        "question":   question,
+        "query_type": query_type,
+        "answer":     final_answer,
+        "audit":      audit,
+        "sources": [
+            {
+                "policy_id": d.metadata.get("policy_id"),
+                "url":       d.metadata.get("url"),
+                "section":   d.metadata.get("section"),
+                "date":      d.metadata.get("collection_date"),
+                "text":      d.page_content,
+            }
+            for d in docs
+        ],
+    }
+    st.download_button(
+        label="📥 Export Report (JSON)",
+        data=json.dumps(export_data, indent=2, ensure_ascii=False),
+        file_name="privacy_audit_report.json",
+        mime="application/json",
+    )
+
+    # ── Source documents ──────────────────────────────────────────────────────
     st.divider()
     st.subheader(f"📂 Source Documents ({len(docs)} retrieved)")
 
@@ -142,17 +404,50 @@ if st.button("🔎 Analyze", type="primary") and question.strip():
             f"[{i}] {m.get('policy_id', 'unknown')} — {m.get('url', '')}",
             expanded=(i == 1),
         ):
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             c1.markdown(f"**Policy ID:** `{m.get('policy_id', 'N/A')}`")
             c2.markdown(f"**Collection Date:** `{m.get('collection_date', 'N/A')}`")
-            c3.markdown(f"**Annotations:** `{m.get('annotation_count', '0')}`")
+            c3.markdown(f"**Section:** `{m.get('section', 'N/A')}`")
+            c4.markdown(f"**Annotations:** `{m.get('annotation_count', '0')}`")
+
             st.markdown("**Segment text:**")
+            preview = doc.page_content[:1500]
+            full    = doc.page_content
             st.markdown(
-                f"<div style='background:#f8f9fa;padding:12px;border-radius:6px;"
-                f"font-size:0.9em;border-left:3px solid #dee2e6;color:#212529'>"
-                f"{doc.page_content[:800]}</div>",
+                "<div style='"
+                "background:#f8f9fa;"
+                "padding:12px;"
+                "border-radius:6px;"
+                "font-size:0.9em;"
+                "border-left:3px solid #dee2e6;"
+                "color:#212529"
+                f"'>{preview}{'…' if len(full) > 1500 else ''}</div>",
                 unsafe_allow_html=True,
             )
+            # Full segment toggle
+            if len(full) > 1500:
+                with st.expander("Show full segment"):
+                    st.text(full)
 
-elif st.session_state.get("question_input") == "" :
-    pass  # Don't show warning on initial page load
+
+# ── Query History ─────────────────────────────────────────────────────────────
+
+if st.session_state.get("history"):
+    st.divider()
+    st.subheader("📜 Query History")
+    history = st.session_state["history"]
+    st.caption(f"{len(history)} queries this session")
+
+    for idx, entry in enumerate(reversed(history), 1):
+        v = entry["verdict"]
+        v_icon = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(v, "⚪")
+        q_icon = {"SIMPLE": "🟢", "FILTERED": "🔵", "COMPARE": "🟣", "AMBIGUOUS": "🟡"}.get(
+            entry.get("query_type", ""), "⚪"
+        )
+        with st.expander(
+            f"{idx}. {q_icon} {entry['question'][:80]}{'…' if len(entry['question']) > 80 else ''} "
+            f"— {v_icon} {v} ({entry['score']:.2f})"
+        ):
+            st.markdown(f"**Q:** {entry['question']}")
+            st.markdown(f"**A:** {entry['answer']}")
+            st.caption(f"Faithfulness: {entry['score']:.2f} | Verdict: {v} | Type: {entry.get('query_type', '—')}")

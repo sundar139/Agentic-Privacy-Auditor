@@ -1,34 +1,97 @@
 import re
 import json
 
-from langchain_ollama import OllamaLLM
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-from retrieval.retriever import semantic_search, filtered_search
+from retrieval.retriever import (
+    semantic_search,
+    filtered_search,
+    threshold_search,
+    section_search,
+    year_filtered_search,
+    detect_section_slug,
+)
+
+
+# ── Dynamic k by query type ───────────────────────────────────────────────────
+K_BY_TYPE: dict[str, int] = {
+    "SIMPLE":    5,
+    "FILTERED":  8,   # one site → need broader policy coverage
+    "COMPARE":   5,   # per site → 5 × n_sites total
+    "AMBIGUOUS": 0,   # never retrieve, ask user first
+}
+_QUOTE_K_BOOST = 10  # override for verbatim-quote queries
+
+# Legal-term pairs requiring two independent sub-queries
+_LEGAL_TERM_PAIRS: list[tuple[str, str]] = [
+    ("sell", "share"),
+    ("sell", "disclose"),
+    ("collect", "use"),
+    ("store", "retain"),
+    ("share", "disclose"),
+]
+
+
+# ─────────────────────────────────────────────
+# LLM backend selector
+# ─────────────────────────────────────────────
+
+def _get_llm(model: str = "qwen2.5:7b"):
+    import os
+    if os.environ.get("HF_TOKEN"):
+        from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+        endpoint = HuggingFaceEndpoint(
+            repo_id="Qwen/Qwen2.5-7B-Instruct",
+            task="conversational",
+            huggingfacehub_api_token=os.environ["HF_TOKEN"],
+            temperature=0.01,
+            max_new_tokens=512,
+        )
+        return ChatHuggingFace(llm=endpoint)
+    else:
+        from langchain_ollama import OllamaLLM
+        return OllamaLLM(model=model, temperature=0)
+
+
+def _llm_invoke(llm, prompt: str) -> str:
+    raw = llm.invoke(prompt)
+    return raw.content if hasattr(raw, "content") else raw
+
+
+# ─────────────────────────────────────────────
+# Classifier prompt
+# ─────────────────────────────────────────────
 
 _CLASSIFIER_PROMPT = """You are a query routing agent for a privacy policy database of 115 real websites.
 
 Classify the user question into exactly ONE type:
 
-SIMPLE   - No specific website mentioned. General question across all policies.
-           Example: "What data do websites collect?"
+SIMPLE    - No specific website mentioned. Genuine broad question across all policies.
+            Example: "What data do websites collect?"
 
-FILTERED - ONE specific website is named.
-           Example: "What does amazon.com say about third parties?"
+FILTERED  - ONE specific website is named.
+            Example: "What does amazon.com say about third parties?"
 
-COMPARE  - Explicitly compares TWO OR MORE named websites.
-           Example: "Compare how amazon and nytimes handle data deletion."
+COMPARE   - Explicitly compares TWO OR MORE named websites.
+            Example: "Compare how amazon and nytimes handle data deletion."
+
+AMBIGUOUS - Uses vague pronouns ("they", "it", "the company", "the site") with
+            no identifiable website. Requires clarification before answering.
+            Example: "Do they sell my data?" / "What does it say about cookies?"
 
 RULES:
-- If NO specific website is named, always use SIMPLE. Never invent website names.
-- For FILTERED: put the mentioned domain keyword in filters.url (e.g. "amazon").
+- If no specific website can be identified, prefer AMBIGUOUS over SIMPLE.
+  SIMPLE is for genuine policy-wide questions, not vague pronoun queries.
+- For FILTERED: put the domain keyword in filters.url (e.g. "amazon").
 - For COMPARE: one sub_query per site, each with its domain keyword in filters.url.
 - Never use placeholder URLs like "example.com" or "sample.org".
+- If the question compares legally distinct terms (e.g. "sell" vs "share",
+  "collect" vs "use"), generate two sub_queries — one per term.
 
 Respond ONLY with valid JSON, no markdown:
 {{
-  "type": "SIMPLE" | "FILTERED" | "COMPARE",
+  "type": "SIMPLE" | "FILTERED" | "COMPARE" | "AMBIGUOUS",
   "sub_queries": [
     {{"query": "search string", "filters": {{}}, "k": 5}}
   ],
@@ -40,16 +103,20 @@ User question: {question}
 
 _PLACEHOLDER_DOMAINS = {"example.com", "sample.org", "website.com", "site.com"}
 
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
 def _extract_json(text: str) -> dict:
-    """Strip markdown fences and parse the first JSON object found."""
     text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         return json.loads(match.group())
     return json.loads(text)
 
+
 def _has_hallucinated_urls(plan: dict) -> bool:
-    """Return True if the plan contains invented placeholder URLs."""
     for sq in plan.get("sub_queries", []):
         url = sq.get("filters", {}).get("url", "")
         if url.startswith("contains:"):
@@ -58,111 +125,249 @@ def _has_hallucinated_urls(plan: dict) -> bool:
             return True
     return False
 
+
 def _fallback_plan(question: str) -> dict:
     return {
         "type": "SIMPLE",
-        "sub_queries": [{"query": question, "filters": {}, "k": 5}],
-        "reasoning": "Fallback: no specific site detected.",
+        "sub_queries": [{"query": question, "filters": {}, "k": K_BY_TYPE["SIMPLE"]}],
+        "reasoning": "Fallback: classification failed.",
     }
+
+
+def _extract_year(question: str) -> int | None:
+    match = re.search(r"\b(199\d|20[012]\d|2030)\b", question)
+    return int(match.group(1)) if match else None
+
+
+def _is_quote_query(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in ("quote", "exact wording", "verbatim", "exact text", "copy of"))
+
+
+def _has_legal_term_pair(question: str) -> tuple[str, str] | None:
+    q = question.lower()
+    for a, b in _LEGAL_TERM_PAIRS:
+        if a in q and b in q:
+            return (a, b)
+    return None
+
 
 def _post_filter_by_url(
     vectorstore: Chroma,
     query: str,
     url_keyword: str,
     k: int,
-) -> list[Document]:
+) -> tuple[list[Document], bool]:
     """
-    ChromaDB does not support substring matching, so we fetch broadly
-    then post-filter by checking whether url_keyword appears in the
-    document's URL metadata field.
+    Over-fetches with threshold_search, then post-filters by URL metadata.
+    Returns (docs, in_corpus). in_corpus=False signals the site isn't in OPP-115.
     """
-    candidates = semantic_search(vectorstore, query, k=80)
-    filtered = [
+    candidates = threshold_search(vectorstore, query, k=80)
+    matched = [
         d for d in candidates
         if url_keyword.lower() in d.metadata.get("url", "").lower()
     ][:k]
+    if matched:
+        return matched, True
+    print(f"[Planner] '{url_keyword}' not found in corpus. Returning semantic fallback.")
+    return semantic_search(vectorstore, query, k=k), False
 
-    if not filtered:
-        print(f"[Planner] No matches for url keyword '{url_keyword}'. Using semantic fallback.")
-        filtered = semantic_search(vectorstore, query, k=k)
 
-    return filtered
+def _interleave_site_docs(site_results: dict[str, list[Document]]) -> list[Document]:
+    """
+    FIX: Balanced per-site dedup for COMPARE.
+    Round-robins across sites so neither side dominates the doc list.
+    """
+    seen: set[str] = set()
+    docs: list[Document] = []
+    max_len = max((len(v) for v in site_results.values()), default=0)
+    for i in range(max_len):
+        for site_docs in site_results.values():
+            if i < len(site_docs):
+                doc = site_docs[i]
+                if doc.page_content not in seen:
+                    seen.add(doc.page_content)
+                    docs.append(doc)
+    return docs
+
+
+# ─────────────────────────────────────────────
+# Planner agent
+# ─────────────────────────────────────────────
 
 class PlannerAgent:
     """Routes queries to the appropriate retrieval strategy."""
 
     def __init__(self, vectorstore: Chroma, llm_model: str = "qwen2.5:7b"):
         self.vectorstore = vectorstore
-        self.llm = OllamaLLM(model=llm_model, temperature=0)
+        self.llm = _get_llm(llm_model)
 
     def classify(self, question: str) -> dict:
-        """Classify the question and return a retrieval plan dict."""
-        raw = self.llm.invoke(_CLASSIFIER_PROMPT.format(question=question))
+        raw = _llm_invoke(self.llm, _CLASSIFIER_PROMPT.format(question=question))
         try:
             plan = _extract_json(raw)
         except (json.JSONDecodeError, AttributeError):
             print("[Planner] JSON parse failed — falling back to SIMPLE.")
             return _fallback_plan(question)
-
         if _has_hallucinated_urls(plan):
-            print("[Planner] Hallucinated URLs detected — overriding to SIMPLE.")
+            print("[Planner] Hallucinated URLs — overriding to SIMPLE.")
             return _fallback_plan(question)
-
         return plan
 
     def retrieve(self, question: str) -> tuple[list[Document], dict]:
         """
-        Classify the question and execute the appropriate search strategy.
+        Classify and execute retrieval.
 
-        Returns:
-            Tuple of (retrieved Documents, plan metadata dict).
+        Plan diagnostic keys:
+            ambiguous        : bool  — query needs clarification (no retrieval)
+            corpus_miss      : bool  — FILTERED site not in OPP-115
+            corpus_miss_site : str
+            compare_misses   : list  — sites missing in COMPARE
+            year_filter      : int
+            section_filter   : str  — OPP-115 slug used for section_search
+            quote_query      : bool  — verbatim quote was requested
         """
         plan = self.classify(question)
         query_type = plan.get("type", "SIMPLE")
-        sub_queries = plan.get("sub_queries") or [{"query": question, "filters": {}, "k": 5}]
+        year = _extract_year(question)
+        is_quote = _is_quote_query(question)
+        legal_pair = _has_legal_term_pair(question)
+        section_slug = detect_section_slug(question) if is_quote else None
 
-        print(f"\n[Planner] Type     : {query_type}")
-        print(f"[Planner] Reasoning: {plan.get('reasoning', '')}")
+        # ── AMBIGUOUS: stop immediately, ask for clarification ────────────────
+        if query_type == "AMBIGUOUS":
+            plan["ambiguous"] = True
+            print("[Planner] AMBIGUOUS query — skipping retrieval.")
+            return [], plan
+
+        sub_queries = plan.get("sub_queries") or [
+            {"query": question, "filters": {}, "k": K_BY_TYPE.get(query_type, 5)}
+        ]
+        base_k = _QUOTE_K_BOOST if is_quote else K_BY_TYPE.get(query_type, 5)
+        for sq in sub_queries:
+            sq["k"] = base_k
+
+        if is_quote:
+            plan["quote_query"] = True
+        if section_slug:
+            plan["section_filter"] = section_slug
+
+        print(f"\n[Planner] Type       : {query_type}")
+        print(f"[Planner] Reasoning  : {plan.get('reasoning', '')}")
         print(f"[Planner] Sub-queries: {json.dumps(sub_queries, indent=2)}")
+        if year:
+            print(f"[Planner] Year filter: {year}")
+        if section_slug:
+            print(f"[Planner] Section    : {section_slug}")
+        if legal_pair:
+            print(f"[Planner] Legal pair : {legal_pair}")
 
+        # ── SIMPLE ───────────────────────────────────────────────────────────
         if query_type == "SIMPLE":
             q = sub_queries[0]
-            docs = semantic_search(self.vectorstore, q["query"], k=q.get("k", 5))
 
+            if section_slug:
+                docs = section_search(self.vectorstore, q["query"], section_slug, k=base_k)
+
+            elif legal_pair and len(sub_queries) < 2:
+                # Priority 4: two independent fetches for legal term pair
+                term_a, term_b = legal_pair
+                docs_a = semantic_search(self.vectorstore, f"{q['query']} {term_a}", k=base_k)
+                docs_b = semantic_search(self.vectorstore, f"{q['query']} {term_b}", k=base_k)
+                seen: set[str] = set()
+                docs = []
+                for d in docs_a + docs_b:
+                    if d.page_content not in seen:
+                        seen.add(d.page_content)
+                        docs.append(d)
+
+            elif year:
+                docs = year_filtered_search(self.vectorstore, q["query"], year=year, k=base_k)
+                plan["year_filter"] = year
+
+            else:
+                docs = semantic_search(self.vectorstore, q["query"], k=base_k)
+
+        # ── FILTERED ─────────────────────────────────────────────────────────
         elif query_type == "FILTERED":
             q = sub_queries[0]
             url_kw = q.get("filters", {}).get("url", "")
             date   = q.get("filters", {}).get("collection_date", "")
 
             if url_kw:
-                docs = _post_filter_by_url(self.vectorstore, q["query"], url_kw, q.get("k", 5))
+                if section_slug:
+                    candidates = section_search(
+                        self.vectorstore, q["query"], section_slug, k=base_k * 3
+                    )
+                    matched = [
+                        d for d in candidates
+                        if url_kw.lower() in d.metadata.get("url", "").lower()
+                    ][:base_k]
+                    in_corpus = bool(matched)
+                    docs = matched if matched else candidates[:base_k]
+                else:
+                    docs, in_corpus = _post_filter_by_url(
+                        self.vectorstore, q["query"], url_kw, base_k
+                    )
+
+                if not in_corpus:
+                    plan["corpus_miss"] = True
+                    plan["corpus_miss_site"] = url_kw
+
+                if year and in_corpus:
+                    year_filtered = [d for d in docs if d.metadata.get("year") == year]
+                    if year_filtered:
+                        docs = year_filtered
+                        plan["year_filter"] = year
+                    else:
+                        print(f"[Planner] Year filter {year} removed all docs — relaxing.")
+
+                if legal_pair and in_corpus:
+                    term_a, term_b = legal_pair
+                    extra, _ = _post_filter_by_url(
+                        self.vectorstore, f"{q['query']} {term_b}", url_kw, base_k
+                    )
+                    seen_pc = {d.page_content for d in docs}
+                    docs += [d for d in extra if d.page_content not in seen_pc]
+
             elif date:
                 docs = filtered_search(
                     self.vectorstore, q["query"],
                     filters={"collection_date": date},
-                    k=q.get("k", 5),
+                    k=base_k,
                 )
             else:
-                docs = semantic_search(self.vectorstore, q["query"], k=q.get("k", 5))
+                docs = semantic_search(self.vectorstore, q["query"], k=base_k)
 
+        # ── COMPARE ──────────────────────────────────────────────────────────
         elif query_type == "COMPARE":
-            seen: set[str] = set()
-            docs = []
+            compare_misses: list[str] = []
+            site_results: dict[str, list[Document]] = {}
+
             for sq in sub_queries:
                 url_kw = sq.get("filters", {}).get("url", "")
-                k = sq.get("k", 4)
-                batch = (
-                    _post_filter_by_url(self.vectorstore, sq["query"], url_kw, k)
-                    if url_kw
-                    else semantic_search(self.vectorstore, sq["query"], k=k)
-                )
-                for doc in batch:
-                    if doc.page_content not in seen:
-                        seen.add(doc.page_content)
-                        docs.append(doc)
+                if url_kw:
+                    site_docs, in_corpus = _post_filter_by_url(
+                        self.vectorstore, sq["query"], url_kw, base_k
+                    )
+                    if not in_corpus:
+                        compare_misses.append(url_kw)
+                        print(f"[Planner] COMPARE: '{url_kw}' not in corpus — skipping.")
+                        continue
+                    site_results[url_kw] = site_docs
+                else:
+                    site_results[sq["query"]] = semantic_search(
+                        self.vectorstore, sq["query"], k=base_k
+                    )
 
+            # FIX: balanced interleaving instead of flat append
+            docs = _interleave_site_docs(site_results)
+            if compare_misses:
+                plan["compare_misses"] = compare_misses
+
+        # ── FALLBACK ─────────────────────────────────────────────────────────
         else:
-            docs = semantic_search(self.vectorstore, question, k=5)
+            docs = semantic_search(self.vectorstore, question, k=K_BY_TYPE["SIMPLE"])
 
         print(f"[Planner] Retrieved {len(docs)} documents.")
         return docs, plan
