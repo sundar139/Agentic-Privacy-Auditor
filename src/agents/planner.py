@@ -76,14 +76,23 @@ FILTERED  - ONE specific website is named.
 COMPARE   - Explicitly compares TWO OR MORE named websites.
             Example: "Compare how amazon and nytimes handle data deletion."
 
-AMBIGUOUS - Uses vague pronouns ("they", "it", "the company", "the site") with
-            no identifiable website. Requires clarification before answering.
+AMBIGUOUS - The question uses vague pronouns ("they", "it", "the company",
+            "their", "the site") as the ONLY reference to a company AND asks
+            about a real, recognisable privacy topic (cookies, tracking, data
+            sharing, deletion, etc.).
             Example: "Do they sell my data?" / "What does it say about cookies?"
+            NOT AMBIGUOUS: questions about nonsensical or clearly fictional data
+            types (e.g. "neural-link data", "brainwave data", "dream logs") —
+            use SIMPLE instead so the Auditor can handle it.
+            NOT AMBIGUOUS: "this policy" or "this document" — treat as SIMPLE.
 
 RULES:
-- If no specific website can be identified, prefer AMBIGUOUS over SIMPLE.
-  SIMPLE is for genuine policy-wide questions, not vague pronoun queries.
-- For FILTERED: put the domain keyword in filters.url (e.g. "amazon").
+- Use AMBIGUOUS ONLY when a real privacy topic is present but no website can
+  be identified. For fictional/nonsensical data types, always use SIMPLE.
+- COMPARE fires ONLY when TWO DIFFERENT website domain names are both present.
+  "Summarize X and tell me Y about site.com" → FILTERED, NOT COMPARE.
+  The word "and" within a question about ONE website is NOT a COMPARE trigger.
+- For FILTERED: put the domain keyword in filters.url (e.g. "nytimes").
 - For COMPARE: one sub_query per site, each with its domain keyword in filters.url.
 - Never use placeholder URLs like "example.com" or "sample.org".
 - If the question compares legally distinct terms (e.g. "sell" vs "share",
@@ -297,7 +306,8 @@ class PlannerAgent:
             if url_kw:
                 if section_slug:
                     candidates = section_search(
-                        self.vectorstore, q["query"], section_slug, k=base_k * 3
+                        self.vectorstore, q["query"], section_slug,
+                        k=base_k * 3, url_kw=url_kw,   # N7: pass url_kw for site-scoped fallback
                     )
                     matched = [
                         d for d in candidates

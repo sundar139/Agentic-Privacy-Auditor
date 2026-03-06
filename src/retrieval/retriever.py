@@ -30,6 +30,37 @@ _SECTION_KEYWORDS: dict[str, str] = {
 _RELEVANCE_THRESHOLD = 0.75
 
 
+_LEGAL_SYNONYMS: dict[str, list[str]] = {
+    "pii":       ["personal information", "personally identifiable", "registration data", "user data", "contact details"],
+    "dnt":       ["do not track", "browser signals", "opt-out of tracking"],
+    "encrypt":   ["secure", "protect", "safeguard", "SSL", "TLS", "encryption"],
+    "delete":    ["remove", "erase", "purge", "right to erasure"],
+    "retention": ["how long", "stored", "keep data", "data storage period"],
+    "gdpr":      ["data protection", "right to access", "right to erasure", "data subject"],
+    "ccpa":      ["California", "opt out of sale", "do not sell"],
+}
+
+
+def expand_query(query: str) -> str:
+    """
+    N2 fix: append synonym expansions for known legal/privacy terms so the
+    embedding space covers policy language that avoids the formal acronym.
+    Only adds terms not already present in the query.
+    """
+    q_lower = query.lower()
+    additions: list[str] = []
+    for term, synonyms in _LEGAL_SYNONYMS.items():
+        if term in q_lower:
+            for syn in synonyms:
+                if syn.lower() not in q_lower:
+                    additions.append(syn)
+    if additions:
+        expanded = query + " " + " ".join(additions[:4])  # cap expansion to 4 terms
+        print(f"[Retriever] Query expanded: '{query}' → '{expanded}'")
+        return expanded
+    return query
+
+
 def detect_section_slug(text: str) -> str | None:
     """Return the first matching OPP-115 section slug found in `text`, or None."""
     lower = text.lower()
@@ -40,7 +71,7 @@ def detect_section_slug(text: str) -> str | None:
 
 
 def semantic_search(vectorstore: Chroma, query: str, k: int = 5) -> list[Document]:
-    return vectorstore.similarity_search(query, k=k)
+    return vectorstore.similarity_search(expand_query(query), k=k)
 
 
 def threshold_search(
@@ -55,7 +86,7 @@ def threshold_search(
     preventing confident answers when the site/topic isn't in the corpus.
     Falls back to top-k unfiltered so corpus-miss logic in the planner can fire.
     """
-    candidates = vectorstore.similarity_search_with_score(query, k=max(k * 4, 20))
+    candidates = vectorstore.similarity_search_with_score(expand_query(query), k=max(k * 4, 20))
     passed = [doc for doc, score in candidates if score < threshold][:k]
     return passed if passed else [doc for doc, _ in candidates[:k]]
 
@@ -83,29 +114,49 @@ def section_search(
     query: str,
     section_slug: str,
     k: int = 10,
+    url_kw: str = "",
 ) -> list[Document]:
     """
     Section-targeted retrieval for 'quote the X section' queries.
 
-    Step 1: Hard metadata filter on `section` slug (OPP-115 category).
-    Step 2: If empty, keyword scan of page_content.
-    Step 3: Unfiltered semantic fallback.
-
-    Use detect_section_slug() to resolve section_slug from the raw question.
-    k defaults to 10 — higher than normal to maximise chance of hitting exact clause.
+    Step 1: Hard metadata filter on section slug, url_kw post-filter if given.
+    Step 2: Keyword scan of page_content (url-scoped when url_kw is set).
+    Step 3 (N7): URL-only fallback when url_kw is set — returns from the right
+                 site even when section metadata is missing after re-ingestion.
+    Step 4: Global unfiltered semantic fallback (last resort).
     """
-    results = filtered_search(vectorstore, query, {"section": section_slug}, k=k)
+    # Step 1
+    raw = filtered_search(vectorstore, query, {"section": section_slug}, k=k * 3 if url_kw else k)
+    if url_kw:
+        results = [d for d in raw if url_kw.lower() in d.metadata.get("url", "").lower()][:k]
+    else:
+        results = raw[:k]
+
     if results:
         return results
 
-    print(f"[Retriever] section_search: no metadata match for '{section_slug}', scanning content.")
-    candidates = vectorstore.similarity_search(query, k=50)
+    # Step 2
+    print(f"[Retriever] section_search: no metadata match for '{section_slug}'"
+          f"{' @ ' + url_kw if url_kw else ''}, scanning content.")
+    candidates = vectorstore.similarity_search(query, k=80)
     keyword = section_slug.replace("_", " ")
-    content_matched = [d for d in candidates if keyword in d.page_content.lower()][:k]
+    content_matched = [
+        d for d in candidates
+        if keyword in d.page_content.lower()
+        and (not url_kw or url_kw.lower() in d.metadata.get("url", "").lower())
+    ][:k]
     if content_matched:
         return content_matched
 
-    print("[Retriever] section_search: content scan empty, falling back to semantic.")
+    # Step 3 (N7 fix)
+    if url_kw:
+        print(f"[Retriever] section_search: falling back to URL-only for '{url_kw}'.")
+        url_only = [d for d in candidates if url_kw.lower() in d.metadata.get("url", "").lower()][:k]
+        if url_only:
+            return url_only
+
+    # Step 4
+    print("[Retriever] section_search: falling back to unfiltered semantic search.")
     return vectorstore.similarity_search(query, k=k)
 
 

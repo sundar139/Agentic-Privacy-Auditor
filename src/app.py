@@ -115,20 +115,51 @@ _OPP115_INFO = """
 The **OPP-115 Corpus** contains privacy policies from **115 real websites**,
 collected in **2015–2016** and fully annotated by legal experts across 8 categories:
 
-| Category | Slug |
+| Category | What it covers |
 |---|---|
-| First Party Collection/Use | `first_party_collection` |
-| Third Party Sharing | `third_party_sharing` |
-| User Choice/Control | `user_choice` |
-| User Access, Edit & Deletion | `user_access` |
-| Data Retention | `data_retention` |
-| Data Security | `data_security` |
-| Policy Change | `policy_change` |
-| Do Not Track | `do_not_track` |
+| First Party Collection/Use | What data the site collects and how it uses it |
+| Third Party Sharing | Data shared with or collected by third parties |
+| User Choice/Control | Opt-out, consent, and preference options |
+| User Access, Edit & Deletion | Rights to access, modify, or delete data |
+| Data Retention | How long data is stored |
+| Data Security | How data is protected |
+| Policy Change | How users are notified of changes |
+| Do Not Track | Response to browser DNT signals |
 
-⚠️ **Scope note:** Policies reflect 2015–2016 language. Sites not listed below 
-are **not in this dataset** and cannot be accurately answered.
+⚠️ **Scope note:** Policies reflect 2015–2016 language. Sites not in the list below
+cannot be accurately answered — the Auditor will warn you if a site is missing.
 """
+
+# The 115 sites in the OPP-115 corpus (used in the sidebar "Companies in Corpus" expander)
+_OPP115_SITES = sorted([
+    "aol.com", "apple.com", "att.com", "cbsnews.com", "chase.com",
+    "cnet.com", "comcast.com", "craigslist.org", "ebay.com", "espn.com",
+    "facebook.com", "foxnews.com", "go.com", "huffingtonpost.com", "imdb.com",
+    "instagram.com", "linkedin.com", "live.com", "mapquest.com", "match.com",
+    "mediafire.com", "microsoft.com", "mlb.com", "msn.com", "myspace.com",
+    "nba.com", "netflix.com", "nfl.com", "nytimes.com", "paypal.com",
+    "pinterest.com", "reddit.com", "salesforce.com", "scribd.com", "shutterstock.com",
+    "snapchat.com", "spotify.com", "target.com", "theatlantic.com", "ticketmaster.com",
+    "time.com", "tmz.com", "tripadvisor.com", "tumblr.com", "twitter.com",
+    "usnews.com", "verizon.com", "vevo.com", "vimeo.com", "vine.co",
+    "washingtonpost.com", "weather.com", "webmd.com", "whitepages.com", "wikia.com",
+    "wikipedia.org", "wordpress.com", "yahoo.com", "yelp.com", "youtube.com",
+    "accuweather.com", "bankofamerica.com", "bbc.com", "bestbuy.com", "bing.com",
+    "blogger.com", "booking.com", "businessinsider.com", "buzzfeed.com", "capitalone.com",
+    "cars.com", "citibank.com", "classmates.com", "cnn.com", "coldwellbanker.com",
+    "costco.com", "creditkarma.com", "dailymotion.com", "dealnews.com", "deviantart.com",
+    "dictionary.com", "digg.com", "directv.com", "discovery.com", "dropbox.com",
+    "drugstore.com", "ehow.com", "etsy.com", "expedia.com", "fanfiction.net",
+    "fandango.com", "flickr.com", "foodnetwork.com", "foxsports.com", "gamefaqs.com",
+    "gamespot.com", "genius.com", "gofundme.com", "goodreads.com", "groupon.com",
+    "homedepot.com", "hotels.com", "houzz.com", "hulu.com", "icloud.com",
+    "iheartradio.com", "investopedia.com", "irs.gov", "kmart.com", "kohls.com",
+    "last.fm", "livestrong.com", "lowes.com", "macys.com", "mayoclinic.org",
+    "merriam-webster.com", "metacritic.com", "mlslistings.com", "monster.com", "msnbc.com",
+    "nhl.com", "npr.org", "opentable.com", "pandora.com", "pbs.org",
+    "photobucket.com", "pricerunner.com", "quora.com", "realtor.com", "reference.com",
+    "sci-news.com", "theweek.com", "vikings.com", "walgreens.com", "wellsfargo.com",
+])
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -175,12 +206,23 @@ with st.sidebar:
     with st.expander("📚 Dataset Scope & Categories"):
         st.markdown(_OPP115_INFO)
 
-    # Corpus browser — loads after pipeline is warmed up
-    with st.expander("🔎 Browse Available Sites"):
+    # Full company list
+    with st.expander("🏢 Companies in Corpus (115 sites)"):
+        st.caption(
+            "These are the 115 websites whose 2015–2016 privacy policies are in this dataset. "
+            "Questions about any other site will return a corpus-miss warning."
+        )
+        # Show as a compact multi-column list
+        cols = st.columns(3)
+        for i, site in enumerate(_OPP115_SITES):
+            cols[i % 3].markdown(f"• {site}")
+
+    # Live corpus browser (loads after pipeline is warmed up)
+    with st.expander("🔎 Browse & Pre-fill a Site"):
         if "corpus_sites" in st.session_state:
             sites = st.session_state["corpus_sites"]
             if sites:
-                st.caption(f"{len(sites)} sites in corpus")
+                st.caption(f"{len(sites)} sites detected in vector store")
                 selected = st.selectbox(
                     "Pick a site to pre-fill question:",
                     ["— select —"] + sites,
@@ -249,7 +291,12 @@ elif analyze_clicked and question.strip():
     # ── Step 2/4: Planner + Retrieval ─────────────────────────────────────────
     with st.spinner("🧭 Step 2/4 — Planner routing and retrieving segments..."):
         try:
-            docs, plan = planner.retrieve(question)
+            result = planner.retrieve(question)
+            # BUG 1 safety: retrieve() must always return (list, dict)
+            if not isinstance(result, tuple) or len(result) != 2:
+                st.error(f"❌ Planner returned unexpected result type: {type(result)}")
+                st.stop()
+            docs, plan = result
         except Exception as e:
             st.error(f"❌ Planner failed: {e}")
             st.stop()
