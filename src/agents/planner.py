@@ -89,9 +89,24 @@ AMBIGUOUS - The question uses vague pronouns ("they", "it", "the company",
 RULES:
 - Use AMBIGUOUS ONLY when a real privacy topic is present but no website can
   be identified. For fictional/nonsensical data types, always use SIMPLE.
-- COMPARE fires ONLY when TWO DIFFERENT website domain names are both present.
-  "Summarize X and tell me Y about site.com" → FILTERED, NOT COMPARE.
-  The word "and" within a question about ONE website is NOT a COMPARE trigger.
+
+CRITICAL — COMPARE vs FILTERED:
+  COMPARE requires EXACTLY TWO OR MORE DIFFERENT domain names. The word "and"
+  NEVER makes a single-site question into a COMPARE.
+  FAILING EXAMPLES that must route to FILTERED, not COMPARE:
+    ✗ "Summarize security measures of washingtonpost.com and tell me if they encrypt passwords"
+       → ONE site (washingtonpost.com) → FILTERED
+    ✗ "Does nytimes.com collect data and share it with third parties?"
+       → ONE site (nytimes.com) → FILTERED
+    ✗ "What does reddit.com say about cookies and tracking?"
+       → ONE site (reddit.com) → FILTERED
+  CORRECT COMPARE examples (two distinct domains both present):
+    ✓ "Compare nytimes.com and washingtonpost.com on data retention"  → COMPARE
+    ✓ "How do reddit.com and twitter.com differ on cookies?"          → COMPARE
+
+  VERIFY before outputting COMPARE: count distinct domain names in the question.
+  If count < 2, output FILTERED.
+
 - For FILTERED: put the domain keyword in filters.url (e.g. "nytimes").
 - For COMPARE: one sub_query per site, each with its domain keyword in filters.url.
 - Never use placeholder URLs like "example.com" or "sample.org".

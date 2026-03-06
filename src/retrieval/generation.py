@@ -2,30 +2,31 @@ import os
 import re
 from langchain_core.documents import Document
 
-# N3: keywords that signal the user wants a specific output format
-_FORMAT_KEYWORDS = [
-    "bulleted list", "bullet points", "numbered list", "as a list",
-    "in a table", "markdown", "format as", "format your response",
-    "as markdown",
-]
+# N3: each keyword maps to the exact formatting instruction to append to the prompt.
+# More specific = more reliably followed by the 7B model.
+_FORMAT_KEYWORDS: dict[str, str] = {
+    "bulleted list":       "\n\nFORMAT (mandatory): Output your answer as a markdown bulleted list. Each point on its own line starting with '- '. Do not use prose paragraphs.",
+    "bullet points":       "\n\nFORMAT (mandatory): Output your answer as a markdown bulleted list. Each point on its own line starting with '- '. Do not use prose paragraphs.",
+    "numbered list":       "\n\nFORMAT (mandatory): Output your answer as a numbered markdown list. Each point on its own line starting with '1.', '2.', etc. Do not use prose paragraphs.",
+    "as a list":           "\n\nFORMAT (mandatory): Output your answer as a markdown bulleted list. Each point on its own line starting with '- '.",
+    "in a table":          "\n\nFORMAT (mandatory): Output your answer as a markdown table with a header row. Use | column | column | syntax.",
+    "as a table":          "\n\nFORMAT (mandatory): Output your answer as a markdown table with a header row. Use | column | column | syntax.",
+    "markdown table":      "\n\nFORMAT (mandatory): Output your answer as a markdown table with a header row. Use | column | column | syntax.",
+    "format as markdown":  "\n\nFORMAT (mandatory): Output your answer using markdown formatting — use headers (##), bullets (-), or bold (**text**) as appropriate.",
+    "format your response":"\n\nFORMAT (mandatory): Strictly follow the output format the user specified in their question.",
+    "as markdown":         "\n\nFORMAT (mandatory): Output your answer using markdown formatting.",
+}
+
 
 def _extract_format_instruction(question: str) -> str:
     """
-    N3 fix: detect formatting requests and return an explicit instruction
-    to append to the prompt so the LLM always honours the user's format.
-    Returns empty string when no format keyword is present.
+    N3 fix: return the specific formatting instruction for the first format
+    keyword found in the question. Returns empty string when none is present.
     """
     q = question.lower()
-    for kw in _FORMAT_KEYWORDS:
+    for kw, instruction in _FORMAT_KEYWORDS.items():
         if kw in q:
-            # Find the original-case fragment from the keyword onward
-            idx = q.find(kw)
-            fragment = question[max(0, idx - 5):].strip()
-            return (
-                f"\n\nFORMAT REQUIREMENT (mandatory): The user explicitly requested a "
-                f"specific output format. You MUST honour this format using only text "
-                f"from the excerpts: \"{fragment}\""
-            )
+            return instruction
     return ""
 
 _BASE_PROMPT = """You are a strict Privacy Policy Compliance Auditor.
@@ -40,6 +41,9 @@ IMPORTANT INSTRUCTIONS:
   correct the premise explicitly — e.g. "The policy does not state X; instead it
   states Y" — then provide what the policy actually says. Do NOT silently return
   "I cannot find this information" when excerpts contain relevant contradicting text.
+  WATCH FOR these common false premises: "immediately", "within 24 hours", "never sells",
+  "always encrypts", "guarantees deletion" — if the policy says something different,
+  state the correction before answering.
 - If the user requests a specific output format (e.g. bulleted list, table, numbered steps), \
 honour that format strictly using only text from the excerpts.
 - If the user asks to "quote" or "extract" specific text, reproduce the exact words from \
@@ -66,6 +70,9 @@ IMPORTANT INSTRUCTIONS:
   correct the premise explicitly — e.g. "The policy does not state X; instead it
   states Y" — then provide what the policy actually says. Do NOT silently return
   "I cannot find this information" when excerpts contain relevant contradicting text.
+  WATCH FOR these common false premises: "immediately", "within 24 hours", "never sells",
+  "always encrypts", "guarantees deletion" — if the policy says something different,
+  state the correction before answering.
 - If the user requests a specific output format (e.g. bulleted list, table, numbered steps), \
 honour that format strictly using only text from the excerpts.
 - If the user asks to "quote" or "extract" specific text, reproduce the exact words from \

@@ -31,32 +31,40 @@ _RELEVANCE_THRESHOLD = 0.75
 
 
 _LEGAL_SYNONYMS: dict[str, list[str]] = {
-    "pii":       ["personal information", "personally identifiable", "registration data", "user data", "contact details"],
-    "dnt":       ["do not track", "browser signals", "opt-out of tracking"],
-    "encrypt":   ["secure", "protect", "safeguard", "SSL", "TLS", "encryption"],
-    "delete":    ["remove", "erase", "purge", "right to erasure"],
-    "retention": ["how long", "stored", "keep data", "data storage period"],
-    "gdpr":      ["data protection", "right to access", "right to erasure", "data subject"],
-    "ccpa":      ["California", "opt out of sale", "do not sell"],
+    # acronym AND spelled-out form both as keys so expansion fires either way
+    "pii":                           ["personal information", "personally identifiable", "registration data", "user data", "contact details", "account information"],
+    "personally identifiable":       ["personal information", "registration data", "user data", "contact details", "account information"],
+    "dnt":                           ["do not track", "browser signals", "opt-out of tracking"],
+    "do not track":                  ["browser signals", "opt-out tracking", "tracking preference"],
+    "encrypt":                       ["secure", "protect", "safeguard", "SSL", "TLS", "encryption"],
+    "delete":                        ["remove", "erase", "purge", "deactivate", "cancel account", "right to erasure"],
+    "retention":                     ["how long", "stored", "keep data", "data storage period"],
+    "gdpr":                          ["data protection", "right to access", "right to erasure", "data subject"],
+    "ccpa":                          ["California", "opt out of sale", "do not sell"],
+    "opt out":                       ["unsubscribe", "withdraw consent", "preference", "choice", "control"],
+    "third party":                   ["partners", "affiliates", "advertisers", "service providers", "vendors"],
 }
 
 
 def expand_query(query: str) -> str:
     """
     N2 fix: append synonym expansions for known legal/privacy terms so the
-    embedding space covers policy language that avoids the formal acronym.
-    Only adds terms not already present in the query.
+    embedding space covers policy language that avoids formal acronyms.
+    Checks both acronym and spelled-out forms. Only adds terms not already present.
     """
     q_lower = query.lower()
+    seen: set[str] = set()
     additions: list[str] = []
     for term, synonyms in _LEGAL_SYNONYMS.items():
         if term in q_lower:
             for syn in synonyms:
-                if syn.lower() not in q_lower:
+                syn_lower = syn.lower()
+                if syn_lower not in q_lower and syn_lower not in seen:
+                    seen.add(syn_lower)
                     additions.append(syn)
     if additions:
-        expanded = query + " " + " ".join(additions[:4])  # cap expansion to 4 terms
-        print(f"[Retriever] Query expanded: '{query}' → '{expanded}'")
+        expanded = query + " " + " ".join(additions[:6])  # cap at 6 to avoid token bloat
+        print(f"[Retriever] Query expanded: '{query[:60]}' + {len(additions)} synonyms")
         return expanded
     return query
 
@@ -138,7 +146,7 @@ def section_search(
     # Step 2
     print(f"[Retriever] section_search: no metadata match for '{section_slug}'"
           f"{' @ ' + url_kw if url_kw else ''}, scanning content.")
-    candidates = vectorstore.similarity_search(query, k=80)
+    candidates = vectorstore.similarity_search(query, k=150)  # large pool ensures URL-scoped fallback finds the right site
     keyword = section_slug.replace("_", " ")
     content_matched = [
         d for d in candidates
