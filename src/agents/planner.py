@@ -165,7 +165,10 @@ def _extract_year(question: str) -> int | None:
 
 def _is_quote_query(question: str) -> bool:
     q = question.lower()
-    return any(kw in q for kw in ("quote", "exact wording", "verbatim", "exact text", "copy of"))
+    return any(kw in q for kw in (
+        "quote", "exact wording", "verbatim", "exact text", "copy of",
+        "first two sentences", "first sentence", "word for word", "exact words",
+    ))
 
 
 def _has_legal_term_pair(question: str) -> tuple[str, str] | None:
@@ -226,6 +229,40 @@ class PlannerAgent:
         self.vectorstore = vectorstore
         self.llm = _get_llm(llm_model)
 
+    # Known OPP-115 domain keywords (first segment of domain, lowercased).
+    # If any of these appear in the question, the LLM must not classify as AMBIGUOUS.
+    _CORPUS_DOMAIN_HINTS = frozenset([
+        "aol", "apple", "att", "cbsnews", "chase", "cnet", "comcast", "craigslist",
+        "ebay", "espn", "facebook", "foxnews", "huffingtonpost", "imdb", "instagram",
+        "linkedin", "mapquest", "match", "mediafire", "microsoft", "mlb", "msn",
+        "nba", "netflix", "nfl", "nytimes", "paypal", "pinterest", "reddit",
+        "salesforce", "scribd", "shutterstock", "snapchat", "spotify", "target",
+        "theatlantic", "ticketmaster", "time", "tmz", "tripadvisor", "tumblr",
+        "twitter", "usnews", "verizon", "vevo", "vimeo", "washingtonpost",
+        "weather", "webmd", "whitepages", "wikia", "wikipedia", "wordpress",
+        "yahoo", "yelp", "youtube", "accuweather", "bankofamerica", "bbc",
+        "bestbuy", "bing", "blogger", "booking", "businessinsider", "buzzfeed",
+        "capitalone", "cars", "citibank", "classmates", "cnn", "coldwellbanker",
+        "costco", "creditkarma", "dailymotion", "dealnews", "deviantart",
+        "dictionary", "digg", "directv", "discovery", "dropbox", "drugstore",
+        "ehow", "etsy", "expedia", "fanfiction", "fandango", "flickr",
+        "foodnetwork", "foxsports", "gamefaqs", "gamespot", "genius", "gofundme",
+        "goodreads", "groupon", "homedepot", "hotels", "houzz", "hulu",
+        "icloud", "iheartradio", "investopedia", "irs", "kmart", "kohls",
+        "last", "livestrong", "lowes", "macys", "mayoclinic", "merriam-webster",
+        "metacritic", "monster", "msnbc", "nhl", "npr", "opentable", "pandora",
+        "pbs", "photobucket", "quora", "realtor", "reference", "theweek",
+        "vikings", "walgreens", "wellsfargo", "sci-news",
+    ])
+
+    def _domain_in_question(self, question: str) -> str | None:
+        """Return the first corpus domain keyword found in the question, or None."""
+        q = question.lower()
+        for domain in self._CORPUS_DOMAIN_HINTS:
+            if domain in q:
+                return domain
+        return None
+
     def classify(self, question: str) -> dict:
         raw = _llm_invoke(self.llm, _CLASSIFIER_PROMPT.format(question=question))
         try:
@@ -236,6 +273,22 @@ class PlannerAgent:
         if _has_hallucinated_urls(plan):
             print("[Planner] Hallucinated URLs — overriding to SIMPLE.")
             return _fallback_plan(question)
+
+        # Q14 fix: if the LLM returned AMBIGUOUS but a real corpus domain is
+        # present in the question, override to FILTERED. Domain presence always
+        # wins over pronoun ambiguity detection.
+        if plan.get("type") == "AMBIGUOUS":
+            domain_hit = self._domain_in_question(question)
+            if domain_hit:
+                print(f"[Planner] AMBIGUOUS overridden → FILTERED (domain '{domain_hit}' found).")
+                plan["type"] = "FILTERED"
+                plan["sub_queries"] = [{
+                    "query": question,
+                    "filters": {"url": domain_hit},
+                    "k": K_BY_TYPE["FILTERED"],
+                }]
+                plan["reasoning"] = f"Auto-corrected: domain '{domain_hit}' found in question."
+
         return plan
 
     def retrieve(self, question: str) -> tuple[list[Document], dict]:
@@ -256,7 +309,9 @@ class PlannerAgent:
         year = _extract_year(question)
         is_quote = _is_quote_query(question)
         legal_pair = _has_legal_term_pair(question)
-        section_slug = detect_section_slug(question) if is_quote else None
+        # Fix Q1/Q4/Q11/Q16: detect section for ALL queries — section_search
+        # is used for any section-specific question, not just verbatim quotes.
+        section_slug = detect_section_slug(question)
 
         # ── AMBIGUOUS: stop immediately, ask for clarification ────────────────
         if query_type == "AMBIGUOUS":

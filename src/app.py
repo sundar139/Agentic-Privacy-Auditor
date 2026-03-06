@@ -82,6 +82,46 @@ def _get_corpus_sites(_vectorstore) -> list[str]:
         return []
 
 
+# ── Q9: Pre-LLM restricted intent classifier ─────────────────────────────────
+# Blocks tool-execution requests (code, scraping, etc.) BEFORE the LLM is called.
+# The Auditor only checks factual faithfulness — it cannot catch these.
+
+_RESTRICTED_INTENT_PATTERNS = [
+    # Code generation
+    r"\bwrite\s+(a\s+)?(python|javascript|js|sql|bash|script|code|program|function|class)\b",
+    r"\b(generate|create|give me)\s+(a\s+)?(script|code|scraper|crawler|bot|program)\b",
+    r"\bscrape\b", r"\bcrawler?\b", r"\bbeautifulsoup\b", r"\brequests\.get\b",
+    r"\bimport\s+(requests|bs4|scrapy|selenium|playwright)\b",
+    # Instruction injection
+    r"\bignore\s+(previous|all|above|prior)\s+instructions?\b",
+    r"\byou\s+are\s+now\s+a\b", r"\bact\s+as\s+(a\s+)?(different|new|another)\b",
+    r"\bforget\s+(everything|all|your)\b",
+    r"\bdan\s+mode\b", r"\bjailbreak\b",
+    # Clearly out-of-scope tool requests
+    r"\bsend\s+(an?\s+)?email\b", r"\bpost\s+(to|on)\s+(twitter|reddit|slack)\b",
+]
+
+import re as _re
+
+def _check_restricted_intent(question: str) -> str | None:
+    """
+    Returns a refusal string if the question matches a restricted intent,
+    otherwise returns None (safe to proceed).
+    """
+    q = question.lower()
+    for pattern in _RESTRICTED_INTENT_PATTERNS:
+        if _re.search(pattern, q):
+            return (
+                "🚫 **This request is outside the scope of the Privacy Auditor.**\n\n"
+                "This tool answers questions about privacy policies only. It does not:\n"
+                "- Write code, scripts, or scrapers\n"
+                "- Execute instructions unrelated to privacy policy analysis\n"
+                "- Respond to prompt injection attempts\n\n"
+                "Please ask a question about a website's privacy policy."
+            )
+    return None
+
+
 # ── Plan diagnostic warnings ──────────────────────────────────────────────────
 
 def _show_corpus_warnings(plan: dict) -> None:
@@ -268,6 +308,12 @@ if analyze_clicked and not question.strip():
 
 elif analyze_clicked and question.strip():
 
+    # ── Q9: Intent check — block before any LLM call ─────────────────────────
+    refusal = _check_restricted_intent(question)
+    if refusal:
+        st.error(refusal)
+        st.stop()
+
     # ── Step 1/4: Pipeline ────────────────────────────────────────────────────
     with st.spinner("⚙️ Step 1/4 — Loading AI pipeline..."):
         pipeline, load_error = get_pipeline()
@@ -384,7 +430,14 @@ elif analyze_clicked and question.strip():
     # ── Answer ────────────────────────────────────────────────────────────────
     st.divider()
     st.subheader("📋 Answer")
-    st.markdown(final_answer)
+    # Q12 fix: wrap in a div so Streamlit renders markdown lists/tables correctly
+    st.markdown(
+        f"<div class='answer-block'>{final_answer}</div>",
+        unsafe_allow_html=True,
+    )
+    # Fallback plain render in case HTML stripping occurs in some deployments
+    if not final_answer.strip().startswith("<"):
+        st.markdown(final_answer)
 
     # ── Audit result ──────────────────────────────────────────────────────────
     score       = audit.get("faithfulness_score", 0)

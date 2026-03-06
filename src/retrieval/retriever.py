@@ -3,24 +3,50 @@ from langchain_core.documents import Document
 
 # ── Section keyword → OPP-115 metadata slug ──────────────────────────────────
 _SECTION_KEYWORDS: dict[str, str] = {
-    "security":        "data_security",
-    "data security":   "data_security",
-    "retention":       "data_retention",
-    "data retention":  "data_retention",
-    "sharing":         "third_party_sharing",
-    "third party":     "third_party_sharing",
-    "third-party":     "third_party_sharing",
-    "collection":      "first_party_collection",
-    "first party":     "first_party_collection",
-    "first-party":     "first_party_collection",
-    "user choice":     "user_choice",
-    "opt out":         "user_choice",
-    "opt-out":         "user_choice",
-    "access":          "user_access",
-    "deletion":        "user_access",
-    "policy change":   "policy_change",
-    "do not track":    "do_not_track",
-    "dnt":             "do_not_track",
+    # Data security — Q4/Q16
+    "security":               "data_security",
+    "data security":          "data_security",
+    "information security":   "data_security",
+    "encrypt":                "data_security",
+    "password":               "data_security",
+    "safeguard":              "data_security",
+    "protect":                "data_security",
+    # Data retention — Q1
+    "retention":              "data_retention",
+    "data retention":         "data_retention",
+    "how long":               "data_retention",
+    "retain":                 "data_retention",
+    "retention period":       "data_retention",
+    "stored for":             "data_retention",
+    # Third party sharing
+    "sharing":                "third_party_sharing",
+    "third party":            "third_party_sharing",
+    "third-party":            "third_party_sharing",
+    "share with":             "third_party_sharing",
+    "disclose":               "third_party_sharing",
+    # First party collection — Q11
+    "collection":             "first_party_collection",
+    "first party":            "first_party_collection",
+    "first-party":            "first_party_collection",
+    "personally identifiable":"first_party_collection",
+    "pii":                    "first_party_collection",
+    "personal information":   "first_party_collection",
+    "what data":              "first_party_collection",
+    "what information":       "first_party_collection",
+    # User choice
+    "user choice":            "user_choice",
+    "opt out":                "user_choice",
+    "opt-out":                "user_choice",
+    # User access / deletion
+    "access":                 "user_access",
+    "deletion":               "user_access",
+    "delete":                 "user_access",
+    "remove my data":         "user_access",
+    # Policy change
+    "policy change":          "policy_change",
+    # DNT
+    "do not track":           "do_not_track",
+    "dnt":                    "do_not_track",
 }
 
 # L2 distance threshold for normalised embeddings (normalize_embeddings=True).
