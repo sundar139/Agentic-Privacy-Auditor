@@ -31,8 +31,9 @@ def _extract_format_instruction(question: str) -> str:
 
 _BASE_PROMPT = """You are a strict Privacy Policy Compliance Auditor.
 Answer the question using ONLY the privacy policy excerpts provided below.
-If the answer is not present, respond exactly with:
-"I cannot find this information in the provided privacy policies."
+If the answer is not present in the excerpts, respond with one of these two exact phrases:
+  - "The policy does not mention [topic]." — use when the topic is simply absent from the text.
+  - "I cannot find this information in the provided privacy policies." — use when retrieval may have failed.
 Never add information beyond what is written in the excerpts.
 
 IMPORTANT INSTRUCTIONS:
@@ -50,6 +51,9 @@ honour that format strictly using only text from the excerpts.
 the excerpt verbatim inside quotation marks. Do not paraphrase quoted content.
 - When comparing legally similar terms (e.g. "sell" vs. "share", "collect" vs. "use"), \
 treat each term as a distinct legal concept and address them separately.
+- When listing named entities (companies, services, partners), include ONLY proper company
+  or service names (e.g. Google, DoubleClick, Amazon). Do NOT include mailing addresses,
+  P.O. boxes, department names, or generic descriptions.
 
 --- PRIVACY POLICY EXCERPTS ---
 {context}
@@ -62,7 +66,8 @@ Answer:"""
 _STRICT_PROMPT = """You are an extremely strict Privacy Policy Compliance Auditor.
 Use ONLY the exact information written in the excerpts below. Do not paraphrase
 beyond what is written. Do not draw on any background knowledge.
-If uncertain, respond: "I cannot find this information in the provided privacy policies."
+If the topic is absent from the excerpts, respond: "The policy does not mention [topic]."
+If uncertain whether retrieval failed, respond: "I cannot find this information in the provided privacy policies."
 
 IMPORTANT INSTRUCTIONS:
 - If the question contains a false or unsupported premise (e.g. assumes a specific
@@ -79,6 +84,9 @@ honour that format strictly using only text from the excerpts.
 the excerpt verbatim inside quotation marks. Do not paraphrase quoted content.
 - When comparing legally similar terms (e.g. "sell" vs. "share", "collect" vs. "use"), \
 treat each term as a distinct legal concept and address them separately.
+- When listing named entities (companies, services, partners), include ONLY proper company
+  or service names (e.g. Google, DoubleClick, Amazon). Do NOT include mailing addresses,
+  P.O. boxes, department names, or generic descriptions.
 
 --- PRIVACY POLICY EXCERPTS ---
 {context}
@@ -119,38 +127,54 @@ def _is_server_error(exc: Exception) -> bool:
     return any(code in msg for code in ("500", "502", "503", "504", "service unavailable", "internal server error"))
 
 
-def _generate_with_hf(prompt: str) -> str:
+def _generate_with_hf(prompt: str, _retries: int = 3, _base_delay: float = 8.0) -> str:
+    """
+    BUG #1 fix: exponential backoff for HF quota/rate-limit errors.
+    Retries up to _retries times with doubling delays before falling back
+    to Ollama. No external retry library needed.
+    """
+    import time
     from huggingface_hub import InferenceClient
     client = InferenceClient(
         model="Qwen/Qwen2.5-7B-Instruct",
         token=os.environ["HF_TOKEN"],
     )
+    last_exc = None
+    for attempt in range(_retries):
+        try:
+            response = client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1024,
+                temperature=0.01,
+                stop=["Question:", "---"],
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as exc:
+            last_exc = exc
+            if _is_quota_error(exc):
+                delay = _base_delay * (2 ** attempt)   # 8s, 16s, 32s
+                print(f"[Generation] HF 429/402 on attempt {attempt+1}/{_retries} — "
+                      f"waiting {delay:.0f}s before retry.")
+                time.sleep(delay)
+                continue  # retry
+            if _is_server_error(exc):
+                delay = _base_delay * (2 ** attempt)
+                print(f"[Generation] HF 5xx on attempt {attempt+1}/{_retries} — "
+                      f"waiting {delay:.0f}s before retry.")
+                time.sleep(delay)
+                continue
+            raise  # non-retryable error — propagate immediately
+
+    # All retries exhausted — try local Ollama as final fallback
     try:
-        response = client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            temperature=0.01,
-            stop=["Question:", "---"],
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as exc:
-        if _is_quota_error(exc):
-            # Attempt Ollama fallback before giving up
-            try:
-                print("[Generation] HF 402/429 — attempting Ollama fallback.")
-                return _generate_with_ollama(prompt)
-            except Exception:
-                raise RuntimeError(
-                    "⚠️ The HuggingFace inference service is temporarily unavailable "
-                    "(quota or rate limit reached). Please top up your HF credits, "
-                    "wait a few minutes, or run the app locally with Ollama."
-                ) from exc
-        if _is_server_error(exc):
-            raise RuntimeError(
-                "⚠️ The inference service returned a server error. "
-                "Please try again in a moment."
-            ) from exc
-        raise
+        print("[Generation] HF retries exhausted — attempting Ollama fallback.")
+        return _generate_with_ollama(prompt)
+    except Exception:
+        raise RuntimeError(
+            "⚠️ The HuggingFace inference service is temporarily unavailable "
+            "(quota or rate limit reached). Please top up your HF credits, "
+            "wait a few minutes, or run the app locally with Ollama."
+        ) from last_exc
 
 
 def generate_answer(

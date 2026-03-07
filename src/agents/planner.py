@@ -54,23 +54,37 @@ def _get_llm(model: str = "qwen2.5:7b"):
         return OllamaLLM(model=model, temperature=0)
 
 
-def _llm_invoke(llm, prompt: str) -> str:
-    try:
-        raw = llm.invoke(prompt)
-        return raw.content if hasattr(raw, "content") else raw
-    except Exception as exc:
-        msg = str(exc).lower()
-        if any(code in msg for code in ("402", "429", "payment required", "too many requests", "rate limit")):
-            raise RuntimeError(
-                "⚠️ The HuggingFace inference service is temporarily unavailable "
-                "(quota or rate limit reached). Please top up your HF credits or "
-                "run locally with Ollama."
-            ) from exc
-        if any(code in msg for code in ("500", "502", "503", "504", "service unavailable")):
-            raise RuntimeError(
-                "⚠️ The inference service returned a server error. Please try again."
-            ) from exc
-        raise
+def _llm_invoke(llm, prompt: str, _retries: int = 3, _base_delay: float = 8.0) -> str:
+    """BUG #1 fix: exponential backoff for quota/rate-limit errors on LangChain LLM calls."""
+    import time
+    last_exc = None
+    for attempt in range(_retries):
+        try:
+            raw = llm.invoke(prompt)
+            return raw.content if hasattr(raw, "content") else raw
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            is_quota = any(c in msg for c in ("402", "429", "payment required", "too many requests", "rate limit"))
+            is_server = any(c in msg for c in ("500", "502", "503", "504", "service unavailable"))
+            if is_quota or is_server:
+                delay = _base_delay * (2 ** attempt)
+                print(f"[Planner] LLM error attempt {attempt+1}/{_retries} — "
+                      f"waiting {delay:.0f}s. Error: {type(exc).__name__}")
+                time.sleep(delay)
+                continue
+            raise
+    # All retries exhausted
+    msg = str(last_exc).lower()
+    if any(c in msg for c in ("402", "429", "payment required", "too many requests", "rate limit")):
+        raise RuntimeError(
+            "⚠️ The HuggingFace inference service is temporarily unavailable "
+            "(quota or rate limit reached). Please top up your HF credits or "
+            "run locally with Ollama."
+        ) from last_exc
+    raise RuntimeError(
+        "⚠️ The inference service returned a server error. Please try again."
+    ) from last_exc
 
 
 # ─────────────────────────────────────────────
@@ -245,36 +259,57 @@ class PlannerAgent:
 
     # Known OPP-115 domain keywords (first segment of domain, lowercased).
     # If any of these appear in the question, the LLM must not classify as AMBIGUOUS.
+    # Unambiguous domain tokens — safe to match as substrings (long or unique enough).
     _CORPUS_DOMAIN_HINTS = frozenset([
         "aol", "apple", "att", "cbsnews", "chase", "cnet", "comcast", "craigslist",
         "ebay", "espn", "facebook", "foxnews", "huffingtonpost", "imdb", "instagram",
-        "linkedin", "mapquest", "match", "mediafire", "microsoft", "mlb", "msn",
-        "nba", "netflix", "nfl", "nytimes", "paypal", "pinterest", "reddit",
-        "salesforce", "scribd", "shutterstock", "snapchat", "spotify", "target",
-        "theatlantic", "ticketmaster", "time", "tmz", "tripadvisor", "tumblr",
-        "twitter", "usnews", "verizon", "vevo", "vimeo", "washingtonpost",
-        "weather", "webmd", "whitepages", "wikia", "wikipedia", "wordpress",
-        "yahoo", "yelp", "youtube", "accuweather", "bankofamerica", "bbc",
-        "bestbuy", "bing", "blogger", "booking", "businessinsider", "buzzfeed",
-        "capitalone", "cars", "citibank", "classmates", "cnn", "coldwellbanker",
-        "costco", "creditkarma", "dailymotion", "dealnews", "deviantart",
-        "dictionary", "digg", "directv", "discovery", "dropbox", "drugstore",
-        "ehow", "etsy", "expedia", "fanfiction", "fandango", "flickr",
-        "foodnetwork", "foxsports", "gamefaqs", "gamespot", "genius", "gofundme",
-        "goodreads", "groupon", "homedepot", "hotels", "houzz", "hulu",
-        "icloud", "iheartradio", "investopedia", "irs", "kmart", "kohls",
-        "last", "livestrong", "lowes", "macys", "mayoclinic", "merriam-webster",
-        "metacritic", "monster", "msnbc", "nhl", "npr", "opentable", "pandora",
-        "pbs", "photobucket", "quora", "realtor", "reference", "theweek",
-        "vikings", "walgreens", "wellsfargo", "sci-news",
+        "linkedin", "mapquest", "mediafire", "microsoft", "msnbc", "nytimes",
+        "paypal", "pinterest", "reddit", "salesforce", "scribd", "shutterstock",
+        "snapchat", "spotify", "theatlantic", "ticketmaster", "tmz", "tripadvisor",
+        "tumblr", "twitter", "usnews", "verizon", "vevo", "vimeo", "washingtonpost",
+        "webmd", "whitepages", "wikia", "wikipedia", "wordpress", "yahoo", "yelp",
+        "youtube", "accuweather", "bankofamerica", "bestbuy", "bing", "blogger",
+        "booking", "businessinsider", "buzzfeed", "capitalone", "citibank",
+        "classmates", "coldwellbanker", "costco", "creditkarma", "dailymotion",
+        "dealnews", "deviantart", "digg", "directv", "dropbox", "drugstore",
+        "ehow", "etsy", "expedia", "fanfiction", "fandango", "flickr", "foodnetwork",
+        "foxsports", "gamefaqs", "gamespot", "genius", "gofundme", "goodreads",
+        "groupon", "homedepot", "houzz", "hulu", "icloud", "iheartradio",
+        "investopedia", "kmart", "kohls", "livestrong", "lowes", "macys",
+        "mayoclinic", "merriam-webster", "metacritic", "opentable", "pandora",
+        "photobucket", "quora", "realtor", "theweek", "tripadvisor", "walgreens",
+        "wellsfargo", "sci-news",
     ])
 
+    # Ambiguous tokens that are also common English words or substrings of other domains.
+    # These require an explicit TLD suffix (e.g. "time.com") to match safely.
+    _CORPUS_DOMAIN_HINTS_TLD_REQUIRED = frozenset([
+        "time", "match", "target", "cars", "last", "weather", "discovery",
+        "reference", "monster", "hotels", "mlb", "msn", "nba", "nfl", "nhl",
+        "npr", "pbs", "bbc", "cnn", "aol", "irs", "tmz", "dictionary",
+        "vikings", "genius",
+    ])
+    # TLD pattern for the above
+    _TLD_PATTERN = re.compile(
+        r"\b(" + "|".join(_CORPUS_DOMAIN_HINTS_TLD_REQUIRED) + r")\.(com|org|net|gov|edu|io)\b"
+    )
+
     def _domain_in_question(self, question: str) -> str | None:
-        """Return the first corpus domain keyword found in the question, or None."""
+        """
+        BUG #3 fix: use exact substring match only for unambiguous long tokens.
+        Short/ambiguous tokens (time, cars, match…) require an explicit TLD suffix
+        (time.com, cars.com) to avoid false-positive matches inside words like
+        "nytimes" → "time" or "immediately" → "time".
+        """
         q = question.lower()
+        # First: check unambiguous domain hints as substrings
         for domain in self._CORPUS_DOMAIN_HINTS:
             if domain in q:
                 return domain
+        # Second: check ambiguous tokens only when followed by a TLD
+        m = self._TLD_PATTERN.search(q)
+        if m:
+            return m.group(1)
         return None
 
     def classify(self, question: str) -> dict:

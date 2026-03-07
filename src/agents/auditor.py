@@ -26,22 +26,34 @@ def _is_server_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(code in msg for code in ("500", "502", "503", "504", "service unavailable"))
 
-def _llm_invoke(llm, prompt: str) -> str:
-    try:
-        raw = llm.invoke(prompt)
-        return raw.content if hasattr(raw, "content") else raw
-    except Exception as exc:
-        if _is_quota_error(exc):
-            raise RuntimeError(
-                "⚠️ The HuggingFace inference service is temporarily unavailable "
-                "(quota or rate limit reached). Please top up your HF credits or "
-                "run locally with Ollama."
-            ) from exc
-        if _is_server_error(exc):
-            raise RuntimeError(
-                "⚠️ The inference service returned a server error. Please try again."
-            ) from exc
-        raise
+def _llm_invoke(llm, prompt: str, _retries: int = 3, _base_delay: float = 8.0) -> str:
+    """BUG #1 fix: exponential backoff for quota/rate-limit errors on LangChain LLM calls."""
+    import time
+    last_exc = None
+    for attempt in range(_retries):
+        try:
+            raw = llm.invoke(prompt)
+            return raw.content if hasattr(raw, "content") else raw
+        except Exception as exc:
+            last_exc = exc
+            if _is_quota_error(exc) or _is_server_error(exc):
+                delay = _base_delay * (2 ** attempt)
+                print(f"[Auditor] LLM error attempt {attempt+1}/{_retries} — "
+                      f"waiting {delay:.0f}s. Error: {type(exc).__name__}")
+                time.sleep(delay)
+                continue
+            # BUG #2 fix: re-raise as clean RuntimeError for non-quota errors too
+            raise RuntimeError(f"Auditor LLM call failed: {exc}") from exc
+    # All retries exhausted
+    if _is_quota_error(last_exc):
+        raise RuntimeError(
+            "⚠️ The HuggingFace inference service is temporarily unavailable "
+            "(quota or rate limit reached). Please top up your HF credits or "
+            "run locally with Ollama."
+        ) from last_exc
+    raise RuntimeError(
+        "⚠️ The inference service returned a server error. Please try again."
+    ) from last_exc
 
 _AUDITOR_PROMPT = """You are a factual auditor. Verify whether every specific claim in
 the AI-generated answer is directly supported by the source excerpts below.
@@ -87,7 +99,11 @@ def _format_context(docs: list[Document]) -> str:
     return "\n\n".join(f"[{i}] {doc.page_content[:500]}" for i, doc in enumerate(docs, 1))
 
 def _apply_thresholds(result: dict) -> dict:
-    score = result.get("faithfulness_score", 0.5)
+    score = result.get("faithfulness_score")
+    # BUG #2 fix: score may be None (UNVERIFIED state) — don't apply thresholds
+    if score is None:
+        return result
+    score = float(score)
     if score >= 0.85:
         result["verdict"] = "PASS"
     elif score >= 0.70:
@@ -108,8 +124,13 @@ class AuditorAgent:
                 "unsupported_claims": ["No source documents were retrieved."],
                 "reasoning": "Answer has no grounding.",
             }
+        # BUG #2 fix: guard against None answer (e.g. generation step returned None)
+        safe_answer = str(answer) if answer is not None else "No answer was generated."
+        safe_context = _format_context(docs) or "No context available."
         try:
-            raw = _llm_invoke(self.llm, _AUDITOR_PROMPT.format(context=_format_context(docs), answer=answer))
+            raw = _llm_invoke(self.llm, _AUDITOR_PROMPT.format(
+                context=safe_context, answer=safe_answer
+            ))
         except RuntimeError as exc:
             # 402/429/5xx from HF — return a degraded-but-informative audit result
             # so the answer is still shown with a warning, not suppressed entirely
@@ -137,9 +158,12 @@ class AuditorAgent:
 
     def audit_and_regenerate(self, question, answer, docs, generate_fn, max_retries=1):
         audit = self.audit(answer, docs)
-        if audit["verdict"] in ("PASS", "WARN"):
+        if audit["verdict"] in ("PASS", "WARN", "UNVERIFIED"):
             return answer, audit
-        print(f"[Auditor] FAIL (score={audit['faithfulness_score']:.2f}). Regenerating...")
+        # BUG #2 fix: faithfulness_score may be None on UNVERIFIED — guard before .2f
+        score_val = audit.get("faithfulness_score")
+        score_str = f"{score_val:.2f}" if score_val is not None else "N/A"
+        print(f"[Auditor] FAIL (score={score_str}). Regenerating...")
         for attempt in range(max_retries):
             new_answer = generate_fn(question, docs, strict=True)
             new_audit = self.audit(new_answer, docs)
