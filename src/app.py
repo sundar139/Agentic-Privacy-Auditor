@@ -101,25 +101,55 @@ _RESTRICTED_INTENT_PATTERNS = [
     r"\bsend\s+(an?\s+)?email\b", r"\bpost\s+(to|on)\s+(twitter|reddit|slack)\b",
 ]
 
+# Privacy-related keywords that indicate a valid policy question exists in the query
+_PRIVACY_KEYWORDS = [
+    "privacy", "policy", "data", "collect", "share", "sell", "retain", "deletion",
+    "tracking", "cookie", "consent", "opt", "third party", "personal information",
+    "security", "encrypt", "gdpr", "ccpa", "do not track", "advertising",
+]
+
 import re as _re
 
-def _check_restricted_intent(question: str) -> str | None:
+_HARDCODED_REFUSAL = (
+    "🚫 **I am a legal compliance assistant and can only answer questions about privacy policies.**\n\n"
+    "This tool does **not**:\n"
+    "- Write code, scripts, or web scrapers\n"
+    "- Execute instructions unrelated to privacy policy analysis\n"
+    "- Respond to persona-override or prompt injection attempts\n\n"
+    "Please ask a question about a specific website's privacy policy."
+)
+
+
+def _check_restricted_intent(question: str) -> tuple[bool, bool]:
     """
-    Returns a refusal string if the question matches a restricted intent,
-    otherwise returns None (safe to proceed).
+    Returns (has_restricted, has_valid_privacy) tuple.
+    - has_restricted: True if question contains a restricted intent pattern
+    - has_valid_privacy: True if question also contains a valid privacy question
+    This enables Q9 multi-intent split: answer the valid part, refuse only the restricted part.
     """
     q = question.lower()
-    for pattern in _RESTRICTED_INTENT_PATTERNS:
-        if _re.search(pattern, q):
-            return (
-                "🚫 **This request is outside the scope of the Privacy Auditor.**\n\n"
-                "This tool answers questions about privacy policies only. It does not:\n"
-                "- Write code, scripts, or scrapers\n"
-                "- Execute instructions unrelated to privacy policy analysis\n"
-                "- Respond to prompt injection attempts\n\n"
-                "Please ask a question about a website's privacy policy."
-            )
-    return None
+    has_restricted = any(_re.search(p, q) for p in _RESTRICTED_INTENT_PATTERNS)
+    has_valid_privacy = any(kw in q for kw in _PRIVACY_KEYWORDS)
+    return has_restricted, has_valid_privacy
+
+
+def _strip_restricted_part(question: str) -> str:
+    """
+    Q9 fix: for multi-intent queries, extract just the privacy-policy question
+    by splitting on common conjunctions and keeping only the valid sentence(s).
+    """
+    # Split on ". Also", "and also", ". Additionally", "and then", ". Then"
+    import re
+    parts = re.split(
+        r"\.\s+(?:also|additionally|then|finally|next|after that)\b"
+        r"|\band\s+(?:also\s+)?(?:write|create|generate|give me|scrape|make)\b"
+        r"|\.\s+(?:write|create|generate|give me|scrape|make)\b",
+        question,
+        flags=re.IGNORECASE,
+    )
+    # Keep only parts that contain a privacy keyword
+    valid_parts = [p.strip() for p in parts if any(kw in p.lower() for kw in _PRIVACY_KEYWORDS)]
+    return " ".join(valid_parts) if valid_parts else question
 
 
 # ── Plan diagnostic warnings ──────────────────────────────────────────────────
@@ -309,10 +339,23 @@ if analyze_clicked and not question.strip():
 elif analyze_clicked and question.strip():
 
     # ── Q9: Intent check — block before any LLM call ─────────────────────────
-    refusal = _check_restricted_intent(question)
-    if refusal:
-        st.error(refusal)
-        st.stop()
+    has_restricted, has_valid_privacy = _check_restricted_intent(question)
+    if has_restricted:
+        if has_valid_privacy:
+            # Q9 multi-intent: warn about the restricted part, strip it, continue
+            st.warning(
+                "⚠️ **Part of your request is outside scope.**\n\n"
+                "I am a legal compliance assistant and **cannot** write code or scripts. "
+                "I will answer the privacy policy question only and ignore the rest."
+            )
+            question = _strip_restricted_part(question)
+            if not question.strip():
+                st.error(_HARDCODED_REFUSAL)
+                st.stop()
+        else:
+            # Entire query is restricted — hard block
+            st.error(_HARDCODED_REFUSAL)
+            st.stop()
 
     # ── Step 1/4: Pipeline ────────────────────────────────────────────────────
     with st.spinner("⚙️ Step 1/4 — Loading AI pipeline..."):

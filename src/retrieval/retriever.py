@@ -120,7 +120,7 @@ def threshold_search(
     preventing confident answers when the site/topic isn't in the corpus.
     Falls back to top-k unfiltered so corpus-miss logic in the planner can fire.
     """
-    candidates = vectorstore.similarity_search_with_score(expand_query(query), k=max(k * 4, 20))
+    candidates = vectorstore.similarity_search_with_score(expand_query(query), k=max(k * 6, 40))
     passed = [doc for doc, score in candidates if score < threshold][:k]
     return passed if passed else [doc for doc, _ in candidates[:k]]
 

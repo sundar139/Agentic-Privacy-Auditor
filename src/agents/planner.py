@@ -17,11 +17,11 @@ from retrieval.retriever import (
 # ── Dynamic k by query type ───────────────────────────────────────────────────
 K_BY_TYPE: dict[str, int] = {
     "SIMPLE":    5,
-    "FILTERED":  8,   # one site → need broader policy coverage
-    "COMPARE":   5,   # per site → 5 × n_sites total
+    "FILTERED":  15,  # one site — need broad coverage; raised from 8 to surface section chunks
+    "COMPARE":   6,   # per site — slightly raised from 5
     "AMBIGUOUS": 0,   # never retrieve, ask user first
 }
-_QUOTE_K_BOOST = 10  # override for verbatim-quote queries
+_QUOTE_K_BOOST = 15  # verbatim-quote queries — raised from 10
 
 # Legal-term pairs requiring two independent sub-queries
 _LEGAL_TERM_PAIRS: list[tuple[str, str]] = [
@@ -203,7 +203,7 @@ def _post_filter_by_url(
     Over-fetches with threshold_search, then post-filters by URL metadata.
     Returns (docs, in_corpus). in_corpus=False signals the site isn't in OPP-115.
     """
-    candidates = threshold_search(vectorstore, query, k=80)
+    candidates = threshold_search(vectorstore, query, k=250)  # large pool for URL post-filter
     matched = [
         d for d in candidates
         if url_keyword.lower() in d.metadata.get("url", "").lower()
@@ -282,8 +282,24 @@ class PlannerAgent:
         try:
             plan = _extract_json(raw)
         except (json.JSONDecodeError, AttributeError):
-            print("[Planner] JSON parse failed — falling back to SIMPLE.")
+            # Q15 fix: JSON parse failed — use domain-aware fallback instead of
+            # blindly defaulting to SIMPLE. If a corpus domain is in the question,
+            # return FILTERED so the answer isn't lost.
+            domain_hit = self._domain_in_question(question)
+            if domain_hit:
+                print(f"[Planner] JSON parse failed — domain '{domain_hit}' found → FILTERED fallback.")
+                return {
+                    "type": "FILTERED",
+                    "sub_queries": [{
+                        "query": question,
+                        "filters": {"url": domain_hit},
+                        "k": K_BY_TYPE["FILTERED"],
+                    }],
+                    "reasoning": f"Fallback: classification failed but domain '{domain_hit}' found.",
+                }
+            print("[Planner] JSON parse failed — no domain found → SIMPLE fallback.")
             return _fallback_plan(question)
+
         if _has_hallucinated_urls(plan):
             print("[Planner] Hallucinated URLs — overriding to SIMPLE.")
             return _fallback_plan(question)
@@ -291,17 +307,20 @@ class PlannerAgent:
         # Q14 fix: if the LLM returned AMBIGUOUS but a real corpus domain is
         # present in the question, override to FILTERED. Domain presence always
         # wins over pronoun ambiguity detection.
-        if plan.get("type") == "AMBIGUOUS":
+        # Q6 fix: same override for SIMPLE — a query naming a real site should
+        # always route to FILTERED even if the topic seems fictional/nonsensical.
+        if plan.get("type") in ("AMBIGUOUS", "SIMPLE"):
             domain_hit = self._domain_in_question(question)
             if domain_hit:
-                print(f"[Planner] AMBIGUOUS overridden → FILTERED (domain '{domain_hit}' found).")
+                old_type = plan["type"]
+                print(f"[Planner] {old_type} overridden → FILTERED (domain '{domain_hit}' found).")
                 plan["type"] = "FILTERED"
                 plan["sub_queries"] = [{
                     "query": question,
                     "filters": {"url": domain_hit},
                     "k": K_BY_TYPE["FILTERED"],
                 }]
-                plan["reasoning"] = f"Auto-corrected: domain '{domain_hit}' found in question."
+                plan["reasoning"] = f"Auto-corrected from {old_type}: domain '{domain_hit}' found in question."
 
         return plan
 
