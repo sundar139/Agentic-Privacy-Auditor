@@ -140,6 +140,15 @@ CRITICAL — COMPARE vs FILTERED:
 - Never use placeholder URLs like "example.com" or "sample.org".
 - If the question compares legally distinct terms (e.g. "sell" vs "share",
   "collect" vs "use"), generate two sub_queries — one per term.
+- For SIMPLE queries with two DISTINCT topics joined by "and", "+", or
+  "also tell me about", generate ONE sub_query PER TOPIC:
+    Example: "Summarize security measures AND tell me about encryption"
+      → sub_queries: [{"query": "security measures safeguards", "filters": {}, "k": 5},
+                      {"query": "encryption password hashing", "filters": {}, "k": 5}]
+    Example: "What data do websites collect AND how long do they retain it?"
+      → sub_queries: [{"query": "data collection personal information", "filters": {}, "k": 5},
+                      {"query": "data retention storage period", "filters": {}, "k": 5}]
+  DO NOT split on "and" within a single concept ("cookies and tracking" → ONE sub_query).
 
 Respond ONLY with valid JSON, no markdown:
 {{
@@ -154,6 +163,36 @@ User question: {question}
 """
 
 _PLACEHOLDER_DOMAINS = {"example.com", "sample.org", "website.com", "site.com"}
+
+# Minimum set of privacy-domain keywords. If a question contains none of these
+# AND no corpus domain, it is treated as off-topic (injection / irrelevant query).
+# NOTE: do NOT include "compliance" — it appears verbatim in injection attacks
+# ("You are no longer a compliance auditor") and would bypass the guard.
+_PRIVACY_KEYWORDS = frozenset([
+    "privacy", "policy", "policies", "data", "collect", "share", "sell",
+    "track", "cookie", "cookies", "personal", "information", "third party",
+    "third-party", "disclose", "retain", "store", "delete", "secure",
+    "encrypt", "consent", "opt-out", "opt out", "opt in", "gdpr", "ccpa",
+    "jurisdiction", "legal", "law", "access", "breach",
+    "transfer", "right", "rights", "account", "profile", "advertis",
+    "marketing", "behavioral", "location", "device", "email", "dispute",
+    "governing", "arbitration", "identif", "anonymi", "aggregate",
+    "password", "children", "minors", "coppa", "ip address",
+])
+
+# Common prompt-injection openers — these immediately signal off-topic regardless
+# of any other keywords that may coincidentally appear in the injected text.
+_INJECTION_PHRASES = (
+    "ignore all previous instructions",
+    "ignore previous instructions",
+    "disregard your instructions",
+    "forget your instructions",
+    "you are no longer",
+    "you are now a",
+    "pretend you are",
+    "act as if you are",
+    "stop being a",
+)
 
 
 # ─────────────────────────────────────────────
@@ -205,6 +244,30 @@ def _has_legal_term_pair(question: str) -> tuple[str, str] | None:
         if a in q and b in q:
             return (a, b)
     return None
+
+
+# Matches uppercase "AND", "+" or "&" plus optional imperative bridge words.
+# NOT re.IGNORECASE: lowercase "and" in single-concept phrases ("cookies and tracking")
+# must NOT trigger a split; only explicit uppercase AND / + / & does.
+_MULTI_INTENT_RE = re.compile(
+    r"\s+(?:AND|[+&])\s+(?:(?:also|additionally)\s+)?(?:tell\s+me|explain|describe|summarize|check(?:\s+for)?|show\s+me|list)?\s*(?:about|if|whether|how)?\s*",
+)
+
+
+def _split_multi_intent(question: str) -> list[str] | None:
+    """
+    Q4 pre-LLM heuristic: detect "X AND tell me about Y" patterns and return
+    the split fragments as separate sub-question strings.
+    Returns None when no actionable split is found (prevents over-splitting).
+    Guards: the leading fragment must be >= 3 words (rules out trivial splits);
+    trailing fragments may be a single topic word (e.g. "encryption" is fine).
+    """
+    parts = _MULTI_INTENT_RE.split(question.strip())
+    parts = [p.strip() for p in parts if p.strip()]
+    # Leading fragment must be substantial; trailing fragments need only be non-empty.
+    if len(parts) < 2 or len(parts[0].split()) < 3:
+        return None
+    return parts
 
 
 def _post_filter_by_url(
@@ -312,6 +375,50 @@ class PlannerAgent:
             return m.group(1)
         return None
 
+    def _extract_all_domains(self, question: str) -> list[str]:
+        """
+        Return every corpus domain keyword present in the question, in order of
+        first appearance. Used to repair COMPARE sub_queries that are missing
+        URL filters (small LLMs sometimes omit them).
+        """
+        q = question.lower()
+        found: list[str] = []
+        seen: set[str] = set()
+        for domain in self._CORPUS_DOMAIN_HINTS:
+            if domain in q and domain not in seen:
+                found.append(domain)
+                seen.add(domain)
+        for m in self._TLD_PATTERN.finditer(q):
+            d = m.group(1)
+            if d not in seen:
+                found.append(d)
+                seen.add(d)
+        return found
+
+    def _is_off_topic(self, question: str) -> bool:
+        """
+        Returns True when the question has no privacy-related keywords AND no
+        recognized corpus domain — used to block prompt-injection attacks and
+        clearly irrelevant queries before any LLM call is made.
+
+        Two-stage check:
+          1. Explicit injection phrases → always off-topic (overrides everything).
+          2. No privacy keyword AND no corpus domain → off-topic.
+        """
+        q = question.lower()
+        # Stage 1: explicit injection pattern always → off-topic
+        for phrase in _INJECTION_PHRASES:
+            if phrase in q:
+                return True
+        # Stage 2: at least one privacy keyword → on-topic
+        for kw in _PRIVACY_KEYWORDS:
+            if kw in q:
+                return False
+        # Stage 3: corpus domain present → could be a vague but valid policy question
+        if self._domain_in_question(question):
+            return False
+        return True
+
     def classify(self, question: str) -> dict:
         raw = _llm_invoke(self.llm, _CLASSIFIER_PROMPT.format(question=question))
         try:
@@ -372,6 +479,16 @@ class PlannerAgent:
             section_filter   : str  — OPP-115 slug used for section_search
             quote_query      : bool  — verbatim quote was requested
         """
+        # ── Off-topic / prompt-injection guard ───────────────────────────────
+        if self._is_off_topic(question):
+            print("[Planner] OFF-TOPIC query — skipping retrieval.")
+            return [], {
+                "type": "OFF_TOPIC",
+                "sub_queries": [],
+                "off_topic": True,
+                "reasoning": "Query does not appear to relate to privacy policies.",
+            }
+
         plan = self.classify(question)
         query_type = plan.get("type", "SIMPLE")
         year = _extract_year(question)
@@ -394,6 +511,14 @@ class PlannerAgent:
         for sq in sub_queries:
             sq["k"] = base_k
 
+        # Q4 fix: pre-LLM multi-intent override — if SIMPLE but the LLM collapsed
+        # two AND-joined distinct topics into a single sub_query, split them here.
+        if query_type == "SIMPLE" and len(sub_queries) == 1:
+            split_parts = _split_multi_intent(question)
+            if split_parts:
+                sub_queries = [{"query": p, "filters": {}, "k": base_k} for p in split_parts]
+                print(f"[Planner] Multi-intent AND-split → {len(sub_queries)} sub_queries.")
+
         if is_quote:
             plan["quote_query"] = True
         if section_slug:
@@ -411,29 +536,48 @@ class PlannerAgent:
 
         # ── SIMPLE ───────────────────────────────────────────────────────────
         if query_type == "SIMPLE":
-            q = sub_queries[0]
-
-            if section_slug:
-                docs = section_search(self.vectorstore, q["query"], section_slug, k=base_k)
-
-            elif legal_pair and len(sub_queries) < 2:
-                # Priority 4: two independent fetches for legal term pair
-                term_a, term_b = legal_pair
-                docs_a = semantic_search(self.vectorstore, f"{q['query']} {term_a}", k=base_k)
-                docs_b = semantic_search(self.vectorstore, f"{q['query']} {term_b}", k=base_k)
-                seen: set[str] = set()
+            if len(sub_queries) > 1:
+                # Multi-intent: process each sub_query independently and merge.
+                # Handles queries like "Summarize security + tell me about encryption"
+                # where the LLM correctly decomposes into multiple sub-tasks.
+                seen_pc: set[str] = set()
                 docs = []
-                for d in docs_a + docs_b:
-                    if d.page_content not in seen:
-                        seen.add(d.page_content)
-                        docs.append(d)
-
-            elif year:
-                docs = year_filtered_search(self.vectorstore, q["query"], year=year, k=base_k)
-                plan["year_filter"] = year
-
+                for sq in sub_queries:
+                    sub_slug = detect_section_slug(sq["query"])
+                    if sub_slug:
+                        sub_docs = section_search(self.vectorstore, sq["query"], sub_slug, k=sq["k"])
+                    elif year:
+                        sub_docs = year_filtered_search(self.vectorstore, sq["query"], year=year, k=sq["k"])
+                    else:
+                        sub_docs = semantic_search(self.vectorstore, sq["query"], k=sq["k"])
+                    for d in sub_docs:
+                        if d.page_content not in seen_pc:
+                            seen_pc.add(d.page_content)
+                            docs.append(d)
             else:
-                docs = semantic_search(self.vectorstore, q["query"], k=base_k)
+                q = sub_queries[0]
+
+                if section_slug:
+                    docs = section_search(self.vectorstore, q["query"], section_slug, k=base_k)
+
+                elif legal_pair:
+                    # Priority 4: two independent fetches for legal term pair
+                    term_a, term_b = legal_pair
+                    docs_a = semantic_search(self.vectorstore, f"{q['query']} {term_a}", k=base_k)
+                    docs_b = semantic_search(self.vectorstore, f"{q['query']} {term_b}", k=base_k)
+                    seen: set[str] = set()
+                    docs = []
+                    for d in docs_a + docs_b:
+                        if d.page_content not in seen:
+                            seen.add(d.page_content)
+                            docs.append(d)
+
+                elif year:
+                    docs = year_filtered_search(self.vectorstore, q["query"], year=year, k=base_k)
+                    plan["year_filter"] = year
+
+                else:
+                    docs = semantic_search(self.vectorstore, q["query"], k=base_k)
 
         # ── FILTERED ─────────────────────────────────────────────────────────
         elif query_type == "FILTERED":
@@ -452,7 +596,17 @@ class PlannerAgent:
                         if url_kw.lower() in d.metadata.get("url", "").lower()
                     ][:base_k]
                     in_corpus = bool(matched)
-                    docs = matched if matched else candidates[:base_k]
+                    if matched:
+                        docs = matched
+                    else:
+                        # Q11/Q4 fix: section-tagged chunks absent for this site —
+                        # fall back to URL-scoped semantic search so PII/encryption
+                        # synonym expansion (expand_query) still applies.
+                        print(f"[Planner] section_search empty for {url_kw}/{section_slug} "
+                              f"— falling back to URL-scoped semantic search.")
+                        docs, in_corpus = _post_filter_by_url(
+                            self.vectorstore, q["query"], url_kw, base_k
+                        )
                 else:
                     docs, in_corpus = _post_filter_by_url(
                         self.vectorstore, q["query"], url_kw, base_k
@@ -489,6 +643,18 @@ class PlannerAgent:
 
         # ── COMPARE ──────────────────────────────────────────────────────────
         elif query_type == "COMPARE":
+            # Repair sub_queries that are missing URL filters — small LLMs
+            # sometimes omit filters.url even when the prompt says to include it.
+            _domains = self._extract_all_domains(question)
+            if _domains:
+                _domain_iter = iter(_domains)
+                for _sq in sub_queries:
+                    if not _sq.get("filters", {}).get("url"):
+                        try:
+                            _sq.setdefault("filters", {})["url"] = next(_domain_iter)
+                        except StopIteration:
+                            break
+
             compare_misses: list[str] = []
             site_results: dict[str, list[Document]] = {}
 

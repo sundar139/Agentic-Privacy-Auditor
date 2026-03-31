@@ -92,10 +92,16 @@ _RESTRICTED_INTENT_PATTERNS = [
     r"\b(generate|create|give me)\s+(a\s+)?(script|code|scraper|crawler|bot|program)\b",
     r"\bscrape\b", r"\bcrawler?\b", r"\bbeautifulsoup\b", r"\brequests\.get\b",
     r"\bimport\s+(requests|bs4|scrapy|selenium|playwright)\b",
-    # Instruction injection
-    r"\bignore\s+(previous|all|above|prior)\s+instructions?\b",
-    r"\byou\s+are\s+now\s+a\b", r"\bact\s+as\s+(a\s+)?(different|new|another)\b",
+    # Prompt injection / persona override
+    # Pattern covers "ignore [any words] instructions" to handle multi-word variants
+    # like "ignore all previous instructions", "ignore all prior instructions", etc.
+    r"\bignore\s+(?:\w+\s+){0,3}instructions?\b",
+    r"\byou\s+are\s+now\s+a\b",
+    r"\byou\s+are\s+no\s+longer\b",
+    r"\bact\s+as\s+(a\s+)?(different|new|another)\b",
     r"\bforget\s+(everything|all|your)\b",
+    r"\bpretend\s+(?:you\s+are|to\s+be)\b",
+    r"\bstop\s+being\s+a\b",
     r"\bdan\s+mode\b", r"\bjailbreak\b",
     # Clearly out-of-scope tool requests
     r"\bsend\s+(an?\s+)?email\b", r"\bpost\s+(to|on)\s+(twitter|reddit|slack)\b",
@@ -393,6 +399,17 @@ elif analyze_clicked and question.strip():
     query_type = plan.get("type", "SIMPLE")
     badge = {"SIMPLE": "🟢", "FILTERED": "🔵", "COMPARE": "🟣", "AMBIGUOUS": "🟡"}.get(query_type, "⚪")
     st.markdown(f"**Query type:** {badge} `{query_type}` — {plan.get('reasoning', '')}")
+
+    # OFF-TOPIC / prompt-injection guard
+    if plan.get("off_topic"):
+        st.error(
+            "🔒 **Off-topic query detected.**\n\n"
+            "I'm a Privacy Policy Auditor. I can only answer questions about privacy policies.\n\n"
+            "Try asking something like:\n"
+            "- *What data does nytimes.com collect?*\n"
+            "- *Does google.com share data with third parties?*"
+        )
+        st.stop()
 
     # AMBIGUOUS: stop and ask for clarification
     if plan.get("ambiguous"):

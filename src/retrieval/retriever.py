@@ -67,7 +67,10 @@ _LEGAL_SYNONYMS: dict[str, list[str]] = {
     "retention":                     ["how long", "stored", "keep data", "data storage period"],
     "gdpr":                          ["data protection", "right to access", "right to erasure", "data subject"],
     "ccpa":                          ["California", "opt out of sale", "do not sell"],
-    "opt out":                       ["unsubscribe", "withdraw consent", "preference", "choice", "control"],
+    # Q2 fix: prioritise advertising-specific terms that appear in real policy text
+    "opt out":                       ["advertising preferences", "network advertising initiative", "unsubscribe", "withdraw consent", "preference", "choice"],
+    # Q2 fix: "tracking" expands to advertising-flavoured synonyms used by real policies
+    "tracking":                      ["behavioral advertising", "advertising preferences", "interest-based advertising", "network advertising initiative", "targeted ads"],
     "third party":                   ["partners", "affiliates", "advertisers", "service providers", "vendors"],
 }
 
@@ -158,9 +161,15 @@ def section_search(
     Step 3 (N7): URL-only fallback when url_kw is set — returns from the right
                  site even when section metadata is missing after re-ingestion.
     Step 4: Global unfiltered semantic fallback (last resort).
+
+    Q11 fix: expand_query is applied upfront so PII→"personal information" and
+    encrypt→"SSL TLS encryption" synonyms are active in all embedding lookups.
     """
+    # Apply synonym expansion once — used for all embedding calls below
+    expanded = expand_query(query)
+
     # Step 1
-    raw = filtered_search(vectorstore, query, {"section": section_slug}, k=k * 3 if url_kw else k)
+    raw = filtered_search(vectorstore, expanded, {"section": section_slug}, k=k * 3 if url_kw else k)
     if url_kw:
         results = [d for d in raw if url_kw.lower() in d.metadata.get("url", "").lower()][:k]
     else:
@@ -172,7 +181,7 @@ def section_search(
     # Step 2
     print(f"[Retriever] section_search: no metadata match for '{section_slug}'"
           f"{' @ ' + url_kw if url_kw else ''}, scanning content.")
-    candidates = vectorstore.similarity_search(query, k=150)  # large pool ensures URL-scoped fallback finds the right site
+    candidates = vectorstore.similarity_search(expanded, k=150)
     keyword = section_slug.replace("_", " ")
     content_matched = [
         d for d in candidates

@@ -31,20 +31,22 @@ def _extract_format_instruction(question: str) -> str:
 
 _BASE_PROMPT = """You are a strict Privacy Policy Compliance Auditor.
 Answer the question using ONLY the privacy policy excerpts provided below.
-If the answer is not present in the excerpts, respond with one of these two exact phrases:
-  - "The policy does not mention [topic]." — use when the topic is simply absent from the text.
+If the answer is not present in the excerpts, state it clearly using one of these forms:
+  - "The provided policy does not contain any information about <topic>." — write the actual topic name; never use a bracket placeholder like [topic].
   - "I cannot find this information in the provided privacy policies." — use when retrieval may have failed.
 Never add information beyond what is written in the excerpts.
 
 IMPORTANT INSTRUCTIONS:
 - If the question contains a false or unsupported premise (e.g. assumes a specific
-  timeframe, action, or feature the excerpts do not mention or contradict), you MUST
-  correct the premise explicitly — e.g. "The policy does not state X; instead it
-  states Y" — then provide what the policy actually says. Do NOT silently return
-  "I cannot find this information" when excerpts contain relevant contradicting text.
+  timeframe, action, or feature the excerpts do not mention or contradict), you MUST:
+  (1) deny the false premise — "The policy does not state X";
+  (2) then IMMEDIATELY state what the policy actually says about the underlying real
+      topic — e.g. "The actual [topic] stated in the policy is [Y]." NEVER stop at
+      step 1 alone; always complete the answer with the real policy content.
+  Do NOT silently return "I cannot find this information" when relevant text is present.
   WATCH FOR these common false premises: "immediately", "within 24 hours", "never sells",
   "always encrypts", "guarantees deletion" — if the policy says something different,
-  state the correction before answering.
+  state the correction then provide the real answer.
 - If the user requests a specific output format (e.g. bulleted list, table, numbered steps), \
 honour that format strictly using only text from the excerpts.
 - If the user asks to "quote" or "extract" specific text, reproduce the exact words from \
@@ -54,6 +56,13 @@ treat each term as a distinct legal concept and address them separately.
 - When listing named entities (companies, services, partners), include ONLY proper company
   or service names (e.g. Google, DoubleClick, Amazon). Do NOT include mailing addresses,
   P.O. boxes, department names, or generic descriptions.
+- CRITICAL — Jurisdiction / Governing Law: If the question asks about legal jurisdiction,
+  governing law, dispute resolution, or applicable law, you MUST scan every excerpt for
+  phrases like "law of", "governed by", "subject to the laws", "applicable law",
+  "courts of", "jurisdiction of", or any U.S. state or country name appearing near
+  "law", "dispute", or "jurisdiction". If ANY such phrase appears, quote it verbatim and
+  explicitly state the jurisdiction. NEVER say the information is absent when such a
+  phrase is present anywhere in the excerpts.
 
 --- PRIVACY POLICY EXCERPTS ---
 {context}
@@ -66,18 +75,20 @@ Answer:"""
 _STRICT_PROMPT = """You are an extremely strict Privacy Policy Compliance Auditor.
 Use ONLY the exact information written in the excerpts below. Do not paraphrase
 beyond what is written. Do not draw on any background knowledge.
-If the topic is absent from the excerpts, respond: "The policy does not mention [topic]."
+If the topic is absent from the excerpts, state: "The provided policy does not contain any information about <topic>." — use the actual topic name, never a bracket placeholder like [topic].
 If uncertain whether retrieval failed, respond: "I cannot find this information in the provided privacy policies."
 
 IMPORTANT INSTRUCTIONS:
 - If the question contains a false or unsupported premise (e.g. assumes a specific
-  timeframe, action, or feature the excerpts do not mention or contradict), you MUST
-  correct the premise explicitly — e.g. "The policy does not state X; instead it
-  states Y" — then provide what the policy actually says. Do NOT silently return
-  "I cannot find this information" when excerpts contain relevant contradicting text.
+  timeframe, action, or feature the excerpts do not mention or contradict), you MUST:
+  (1) deny the false premise — "The policy does not state X";
+  (2) then IMMEDIATELY state what the policy actually says about the underlying real
+      topic — e.g. "The actual [topic] stated in the policy is [Y]." NEVER stop at
+      step 1 alone; always complete the answer with the real policy content.
+  Do NOT silently return "I cannot find this information" when relevant text is present.
   WATCH FOR these common false premises: "immediately", "within 24 hours", "never sells",
   "always encrypts", "guarantees deletion" — if the policy says something different,
-  state the correction before answering.
+  state the correction then provide the real answer.
 - If the user requests a specific output format (e.g. bulleted list, table, numbered steps), \
 honour that format strictly using only text from the excerpts.
 - If the user asks to "quote" or "extract" specific text, reproduce the exact words from \
@@ -87,6 +98,13 @@ treat each term as a distinct legal concept and address them separately.
 - When listing named entities (companies, services, partners), include ONLY proper company
   or service names (e.g. Google, DoubleClick, Amazon). Do NOT include mailing addresses,
   P.O. boxes, department names, or generic descriptions.
+- CRITICAL — Jurisdiction / Governing Law: If the question asks about legal jurisdiction,
+  governing law, dispute resolution, or applicable law, you MUST scan every excerpt for
+  phrases like "law of", "governed by", "subject to the laws", "applicable law",
+  "courts of", "jurisdiction of", or any U.S. state or country name appearing near
+  "law", "dispute", or "jurisdiction". If ANY such phrase appears, quote it verbatim and
+  explicitly state the jurisdiction. NEVER say the information is absent when such a
+  phrase is present anywhere in the excerpts.
 
 --- PRIVACY POLICY EXCERPTS ---
 {context}
@@ -95,6 +113,67 @@ treat each term as a distinct legal concept and address them separately.
 Question: {question}
 
 Strictly grounded answer:"""
+
+
+# Regex catches any residual bracket placeholders the LLM emits despite prompt instructions.
+_PLACEHOLDER_RE = re.compile(
+    r"[Tt]he (?:provided )?policy does not mention \[([^\]]+)\]",
+    re.IGNORECASE,
+)
+
+
+def _clean_placeholder_answer(text: str) -> str:
+    """Replace LLM bracket-template placeholders (e.g. [topic]) with natural language."""
+    def _subst(m: re.Match) -> str:
+        topic = m.group(1).strip().rstrip(".")
+        return f"The provided policy does not contain any information about {topic}"
+    return _PLACEHOLDER_RE.sub(_subst, text)
+
+
+# Jurisdiction / governing-law phrase scanner — detects governing law clauses in docs.
+# Used to pre-extract and inject as a hard hint so the LLM cannot overlook them.
+_JURISDICTION_PATTERNS = re.compile(
+    r"(?:"
+    r"law\s+of(?:\s+the)?\s+(?:state\s+of\s+)?\w+"
+    r"|governed\s+by(?:\s+the)?\s+laws?\s+of\s+\w+"
+    r"|subject\s+to(?:\s+the)?\s+laws?\s+of\s+\w+"
+    r"|applicable\s+law\s+of\s+\w+"
+    r"|courts?\s+of\s+\w+"
+    r"|jurisdiction\s+of\s+\w+"
+    r"|disputes?\s+(?:will\s+be\s+)?(?:resolved|governed|handled)\s+(?:in|under|by|pursuant\s+to)"
+    r")",
+    re.IGNORECASE,
+)
+
+_JURISDICTION_Q_KEYWORDS = frozenset([
+    "jurisdiction", "govern", "law", "dispute", "legal", "court", "applicable",
+    "washington", "california", "delaware", "new york", "arbitration", "venue",
+])
+
+
+def _extract_jurisdiction_hint(docs: list[Document], question: str) -> str | None:
+    """
+    Pre-scan retrieved docs for governing-law / jurisdiction phrases and return
+    the matching sentence(s) as a hint string, or None if no matches.
+    Only activates when the question appears to be jurisdiction-related.
+    """
+    q_lower = question.lower()
+    if not any(kw in q_lower for kw in _JURISDICTION_Q_KEYWORDS):
+        return None
+    hits: list[str] = []
+    seen: set[str] = set()
+    for doc in docs:
+        text = doc.page_content
+        for m in _JURISDICTION_PATTERNS.finditer(text):
+            start = text.rfind(".", 0, m.start())
+            end = text.find(".", m.end())
+            sentence = text[
+                start + 1 if start >= 0 else 0 : end + 1 if end >= 0 else len(text)
+            ].strip()
+            if sentence and sentence not in seen:
+                hits.append(sentence)
+                seen.add(sentence)
+    return "\n".join(hits) if hits else None
 
 
 def _format_context(docs: list[Document]) -> str:
@@ -189,7 +268,16 @@ def generate_answer(
     )
     # N3: append format instruction if the user specified one
     prompt += _extract_format_instruction(question)
+    # Jurisdiction hint: programmatically pre-extract governing-law phrases so
+    # the LLM cannot overlook them even when its grounding behaviour is overly cautious.
+    jurisdiction_hint = _extract_jurisdiction_hint(docs, question)
+    if jurisdiction_hint:
+        prompt += (
+            "\n\nJURISDICTION PRE-EXTRACTION: The following sentence(s) were found in "
+            "the excerpts above by keyword scan. You MUST reference this in your answer:\n"
+            f"{jurisdiction_hint}"
+        )
     if os.environ.get("HF_TOKEN"):
-        return _generate_with_hf(prompt)
+        return _clean_placeholder_answer(_generate_with_hf(prompt))
     else:
-        return _generate_with_ollama(prompt, llm_model)
+        return _clean_placeholder_answer(_generate_with_ollama(prompt, llm_model))
