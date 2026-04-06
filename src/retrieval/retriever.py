@@ -215,7 +215,7 @@ def year_filtered_search(
     """
     try:
         results = vectorstore.similarity_search(
-            query, k=k, filter={"year": {"$eq": year}},
+            query, k=k, filter={"year": {"$eq": year}},  # type: ignore
         )
     except Exception as exc:
         print(f"[Retriever] year_filtered_search({year}) error: {exc}")

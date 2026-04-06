@@ -260,3 +260,7 @@ For research and teaching purposes only (Creative Commons Attribution-NonCommerc
 
 **Rohith Sundar Jonnalagadda**  
 [LinkedIn](https://www.linkedin.com/in/rohithsundarj/) · MS Computer Science, Kennesaw State University
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
